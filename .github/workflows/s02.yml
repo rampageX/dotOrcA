@@ -40,8 +40,8 @@ jobs:
         shell: pwsh
         run: |
           $exe = if ($IsWindows) { './target/release/orca-benchmark.exe' } else { './target/release/orca-benchmark' }
-          $ffmpeg = (Get-Command ffmpeg -CommandType Application).Source
-          $ffprobe = (Get-Command ffprobe -CommandType Application).Source
+          $ffmpeg = (Get-Command ffmpeg -CommandType Application | Select-Object -First 1).Source
+          $ffprobe = (Get-Command ffprobe -CommandType Application | Select-Object -First 1).Source
           $root = Join-Path (Get-Location) 'S02 小K & (黑洞) ^ % !'
           & $exe --smoke --repeats 1 --ffmpeg $ffmpeg --ffprobe $ffprobe --output $root
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -57,6 +57,20 @@ jobs:
           }
           if (Test-Path -LiteralPath (Join-Path $run.FullName 'work')) { throw 'Temporary files were not cleaned' }
           if (@(Get-ChildItem -LiteralPath (Join-Path $run.FullName 'cases') -File).Count -ne 16) { throw 'Missing per-case records' }
+          foreach ($f in $r.fixtures) {
+            if ($f.file_sha256.Length -ne 64 -or $f.decoded_sha256.Length -ne 64 -or $f.decode_baseline_fps -le 0) { throw "Invalid reference evidence" }
+          }
+          if ($IsWindows -and ($null -eq $r.environment.system_snapshot.version -or $null -eq $r.environment.system_snapshot.memory)) { throw 'Missing Windows environment' }
+          # A second independently generated source must match the first decoded hash.
+          $root2 = Join-Path (Get-Location) 'S02 repeat'
+          & $exe --smoke --repeats 1 --ffmpeg $ffmpeg --ffprobe $ffprobe --output $root2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $run2 = Get-ChildItem -LiteralPath $root2 -Directory | Select-Object -First 1
+          $r2 = Get-Content -LiteralPath (Join-Path $run2.FullName 'report.json') -Raw | ConvertFrom-Json
+          foreach ($f in $r.fixtures) {
+            $second = @($r2.fixtures | Where-Object id -eq $f.id)
+            if ($second.Count -ne 1 -or $second[0].decoded_sha256 -ne $f.decoded_sha256) { throw "Non-repeatable decoded fixture: $($f.id)" }
+          }
           New-Item -ItemType Directory -Force dist-s02 | Out-Null
           Copy-Item -LiteralPath (Join-Path $run.FullName 'report.json') -Destination dist-s02/ci-smoke-report.json
       - name: Windows artifact
