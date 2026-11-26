@@ -1,0 +1,55 @@
+name: S00 Rust GUI arena
+on:
+  push:
+    branches: [test/s00-rust-gui-arena]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        candidate: [winsafe, nwg, gpui]
+    defaults:
+      run:
+        working-directory: arena
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain and lock
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustc -Vv
+          if (-not (Test-Path Cargo.lock)) { cargo generate-lockfile; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          cargo test --locked -p arena-common
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build release and record evidence
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          $pkg = 'arena-${{ matrix.candidate }}'
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p $pkg
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/$pkg.exe"
+          Copy-Item $exe ../dist/
+          Copy-Item Cargo.lock ../dist/
+          (Get-Item $exe).Length | Out-File ../dist/size-bytes.txt
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File ../dist/sha256.txt
+          rustc -Vv | Out-File ../dist/rustc.txt
+          cargo tree --locked -p $pkg | Out-File ../dist/dependencies.txt
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents $exe | Out-File ../dist/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path ../dist) '小K 的鹅腿坟场 & (黑洞) ^ % !.avi'), [byte[]]@())
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arena-${{ matrix.candidate }}
+          path: dist/
+          if-no-files-found: error
