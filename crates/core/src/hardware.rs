@@ -1,0 +1,97 @@
+//! Capability evidence, not encoder policy. No throughput prediction.
+use crate::process::{self,Request,Stop};
+use std::{io,path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Duration,SystemTime}};
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct Adapter {pub name:Option<String>,pub instance_id:Option<String>,pub driver_version:Option<String>}
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct Inventory {pub cpu:Option<String>,pub logical_cpus:Option<usize>,pub adapters:Vec<Adapter>,pub adapter_scan_complete:bool}
+pub fn inventory()->Inventory {
+    #[cfg(windows)] let (adapters,adapter_scan_complete)=match windows::adapters(){Ok(a)=>(a,true),Err(_)=>(Vec::new(),false)};
+    #[cfg(not(windows))] let (adapters,adapter_scan_complete)=(Vec::new(),false);
+    Inventory{cpu:std::env::var("PROCESSOR_IDENTIFIER").ok(),logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete}
+}
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum Evidence { NotListed, Verified, Failed, TimedOut }
+#[derive(Debug,Clone)]
+pub struct Capability {pub encoder:String,pub bit_depth:u8,pub evidence:Evidence,pub diagnostic:String}
+#[derive(Debug,Clone,PartialEq,Eq)]
+struct Fingerprint {exe:PathBuf,size:u64,modified:Option<SystemTime>,version:String,inventory:Inventory}
+#[derive(Debug,Clone)]
+pub struct Report {pub inventory:Inventory,pub tool_version:String,pub capabilities:Vec<Capability>}
+#[derive(Default)]
+pub struct Detector {cache:Option<(Fingerprint,Report)>}
+const ENCODERS:[(&str,u8);15]=[
+    ("h264_nvenc",8),("hevc_nvenc",8),("hevc_nvenc",10),("av1_nvenc",8),("av1_nvenc",10),
+    ("h264_qsv",8),("hevc_qsv",8),("hevc_qsv",10),("av1_qsv",8),("av1_qsv",10),
+    ("h264_amf",8),("hevc_amf",8),("hevc_amf",10),("av1_amf",8),("av1_amf",10),
+];
+fn checked_text(exe:&Path,args:&[&str],cancel:&AtomicBool)->io::Result<String>{
+    let o=process::run(&Request::new(exe).args(args.iter().copied()),cancel)?;
+    if o.stop!=Stop::Exited||!o.status.success()||o.stdout.discarded>0{
+        return Err(io::Error::other(format!("tool query {:?}: {}: {}",o.stop,o.status,String::from_utf8_lossy(&o.stderr.bytes))));
+    }
+    String::from_utf8(o.stdout.bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))
+}
+fn listed(text:&str,encoder:&str)->bool {
+    text.lines().any(|line|{
+        let mut parts=line.split_whitespace();
+        parts.next().is_some_and(|f|f.len()==6&&f.starts_with('V'))&&parts.next()==Some(encoder)
+    })
+}
+fn completed(progress:&str)->bool{
+    progress.lines().filter_map(|line|line.strip_prefix("frame=")).filter_map(|x|x.trim().parse::<u64>().ok()).last().is_some_and(|n|n>=3)
+    && progress.lines().any(|line|line.trim()=="progress=end")
+}
+fn try_encoder(exe:&Path,name:&str,bits:u8,cancel:&AtomicBool)->io::Result<Capability>{
+    let format=if bits==10 {"p010le"} else {"nv12"};
+    let source=format!("color=c=gray:s=256x256:r=30,format={format}");
+    let strict=format!("+{format}");
+    let mut req=Request::new(exe).args(["-hide_banner","-loglevel","error","-nostdin","-progress","pipe:1","-f","lavfi","-i",&source,"-an","-frames:v","3","-c:v",name,"-pix_fmt",&strict,"-f","null","-"]);
+    req.timeout=Duration::from_secs(15);
+    let o=process::run(&req,cancel)?;
+    if o.stop==Stop::Cancelled||cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,"hardware detection cancelled"));}
+    let evidence=if o.stop==Stop::TimedOut{Evidence::TimedOut}
+        else if o.status.success()&&o.stdout.discarded==0&&completed(&String::from_utf8_lossy(&o.stdout.bytes)){Evidence::Verified}
+        else{Evidence::Failed};
+    let diagnostic=format!("{}; stderr discarded={} bytes; {}",o.status,o.stderr.discarded,String::from_utf8_lossy(&o.stderr.bytes));
+    Ok(Capability{encoder:name.into(),bit_depth:bits,evidence,diagnostic})
+}
+impl Detector{
+    /// Memory cache only, keyed by present adapters/driver, tool identity and CPU.
+    /// Failed/timed-out probes are evidence of this attempt, not permanent unsupported claims.
+    pub fn detect(&mut self,exe:&Path,cancel:&AtomicBool)->io::Result<Report>{
+        if !exe.is_absolute(){return Err(io::Error::new(io::ErrorKind::InvalidInput,"absolute ffmpeg path required"));}
+        let exe=std::fs::canonicalize(exe)?;
+        let meta=std::fs::metadata(&exe)?;
+        let version=checked_text(&exe,&["-version"],cancel)?;
+        let inv=inventory();
+        let key=Fingerprint{exe:exe.clone(),size:meta.len(),modified:meta.modified().ok(),version:version.clone(),inventory:inv.clone()};
+        let cacheable=inv.adapter_scan_complete&&inv.cpu.is_some()&&key.modified.is_some()&&inv.adapters.iter().all(|a|a.instance_id.is_some()&&a.driver_version.is_some());
+        if cacheable {
+            if let Some((old,report))=&self.cache {if old==&key{return Ok(report.clone());}}
+        }
+        self.cache=None;
+        let list=checked_text(&exe,&["-hide_banner","-encoders"],cancel)?;
+        let mut capabilities=Vec::new();
+        for (name,bits) in ENCODERS {
+            if cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,"hardware detection cancelled"));}
+            capabilities.push(if listed(&list,name){try_encoder(&exe,name,bits,cancel)?}
+                else{Capability{encoder:name.into(),bit_depth:bits,evidence:Evidence::NotListed,diagnostic:"encoder not compiled into this ffmpeg".into()}});
+        }
+        let report=Report{inventory:inv,tool_version:version,capabilities};
+        // A transient timeout or initialization failure must not be cached indefinitely.
+        if cacheable&&report.capabilities.iter().all(|c|matches!(c.evidence,Evidence::Verified|Evidence::NotListed)){
+            self.cache=Some((key,report.clone()));
+        }
+        Ok(report)
+    }
+}
+#[cfg(test)]
+mod tests{
+    use super::*;
+    #[test]fn exact_encoder_match(){assert!(listed(" V....D hevc_nvenc NVIDIA","hevc_nvenc"));assert!(!listed(" V....D hevc_nvenc_test","hevc_nvenc"));assert!(!listed(" A....D hevc_nvenc","hevc_nvenc"));}
+    #[test]fn verified_requires_actual_frames(){assert!(completed("frame=3\r\nprogress=end\r\n"));assert!(!completed("frame=0\nprogress=end\n"));assert!(!completed("frame=3\nprogress=continue\n"));}
+}
