@@ -45,9 +45,11 @@ jobs:
           $ffmpeg = (Get-Command ffmpeg -CommandType Application | Select-Object -First 1).Source
           $ffprobe = (Get-Command ffprobe -CommandType Application | Select-Object -First 1).Source
           $source = Join-Path (Get-Location) '小K 的鹅腿坟场 & (黑洞) ^ % !.avi'
-          & $ffmpeg -hide_banner -v error -n -f lavfi -i 'testsrc2=size=320x180:rate=24' -t 30 -c:v libx264 -pix_fmt yuv420p -color_trc bt709 -color_primaries bt709 -colorspace bt709 -f matroska $source
+          & $ffmpeg -hide_banner -v error -n -f lavfi -i 'testsrc2=size=320x180:rate=24' -t 30 -c:v libx264 -pix_fmt yuv420p -color_trc bt709 -color_primaries bt709 -colorspace bt709 -bsf:v 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1' -f matroska $source
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $exe = if ($IsWindows) { './target/release/orca-predict.exe' } else { './target/release/orca-predict' }
+          $tags = & $ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,bits_per_raw_sample,color_transfer,color_primaries,color_space -of json $source | ConvertFrom-Json
+          if ($LASTEXITCODE -or $tags.streams[0].color_transfer -ne 'bt709' -or $tags.streams[0].color_primaries -ne 'bt709' -or $tags.streams[0].pix_fmt -ne 'yuv420p') { throw 'Fixture VUI not explicitly SDR' }
           $r = & $exe --validate $source --ffmpeg $ffmpeg --ffprobe $ffprobe | ConvertFrom-Json
           if ($LASTEXITCODE -or $r.results[0].status -ne 'ok' -or $r.results[0].samples.Count -ne 2 -or $r.results[0].holdout.encoded_frames -le 0 -or $null -ne $r.results[0].prediction.production_seconds) { throw 'Missing validation evidence' }
           if ($IsWindows -and $null -eq $r.results[0].samples[0].pretest_system_cpu_busy_pct) { throw 'Missing pretest CPU occupancy' }
