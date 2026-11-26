@@ -38,6 +38,7 @@ typedef struct {
     int font_tried;
     int font_ok;
     int callback_error;
+    int icon_tried;
 } window_state;
 
 /* No font bundled: read a local Windows font by a wide filesystem path.
@@ -123,10 +124,29 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
     cui_pop_id(ui);
 }
 
+/* Shared resource handles remain valid for the life of the module. */
+static int apply_window_icon(HWND hwnd) {
+    if (!hwnd) return 0;
+    HINSTANCE module = GetModuleHandleW(NULL);
+    HICON big = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    HICON small = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    if (!big || !small) return 0;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
+    return SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0) == (LRESULT)big &&
+           SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0) == (LRESULT)small;
+}
+
 static void frame(cui_ctx *ui, void *user) {
     static const char *codecs[] = { "H.264", "HEVC", "AV1" };
     static const char *resolutions[] = { "3840 px", "2560 px", "1920 px", "1280 px" };
     window_state *window = (window_state *)user;
+    if (!window->icon_tried) {
+        window->icon_tried = 1;
+        apply_window_icon((HWND)cui_app_native_window(NULL));
+    }
     if (window->font_pending && !window->font_tried) {
         window->font_tried = 1;
         window->font_ok = load_system_cjk(ui);
@@ -227,8 +247,13 @@ int orca_cui_self_test(void) {
     desc.hidden = true;
     cui_app *app = cui_app_create(&desc);
     if (!app) return 10;
-    int result = 11;
-    window_state window = { .mib = "100", .codec = 1, .font_pending = 1, .font_tried = 1 };
+    int result = 15;
+    if (!apply_window_icon((HWND)cui_app_native_window(app))) {
+        cui_app_destroy(app);
+        return result;
+    }
+    result = 11;
+    window_state window = { .mib = "100", .codec = 1, .font_pending = 1, .font_tried = 1, .icon_tried = 1 };
     if (!cui_app_is_software(app) || !cui_app_frame(app)) goto done;
     cui_ctx *ui = cui_app_ui(app);
     frame(ui, &window);

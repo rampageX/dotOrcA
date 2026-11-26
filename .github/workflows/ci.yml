@@ -82,6 +82,8 @@ jobs:
           $upstream = 'build/_deps/cui-src'
           git -C $upstream rev-parse HEAD | Out-File ../../dist/cui-source.txt
           New-Item -ItemType Directory -Force ../../dist/licenses | Out-Null
+          Copy-Item ICON-ATTRIBUTION.md ../../dist/licenses/
+          Copy-Item LICENSE-TWEMOJI-GRAPHICS.txt ../../dist/licenses/
           foreach ($f in @('LICENSE', 'THIRD_PARTY.md', 'assets/fonts/LICENSE-Inter.txt', 'assets/fonts/LICENSE-Geist.txt', 'assets/fonts/LICENSE-Lucide.txt', 'third_party/LICENSE-Unicode.txt')) {
             Copy-Item (Join-Path $upstream $f) ../../dist/licenses/
           }
