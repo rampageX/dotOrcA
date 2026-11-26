@@ -1,7 +1,15 @@
 //! S02 measurement only. No prediction or encoding policy.
 use crate::{hardware, media, process::{self, Request, Stop}};
 use serde_json::{json, Value};
-use std::{ffi::OsString, fs, io::{self, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{fs, io::{self, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+fn system_snapshot()->Value {
+    #[cfg(windows)] { windows::snapshot() }
+    #[cfg(not(windows))] { json!({"kernel_release":fs::read_to_string("/proc/sys/kernel/osrelease").ok().map(|s|s.trim().to_owned()),"os_release":fs::read_to_string("/etc/os-release").ok(),"memory":fs::read_to_string("/proc/meminfo").ok().map(|s|s.lines().take(3).collect::<Vec<_>>().join("\n"))}) }
+}
 
 pub const SCHEMA: u32 = 1;
 pub const MATRIX: &str = "synthetic-sdr-v1";
@@ -73,6 +81,8 @@ fn frames(s: &str) -> io::Result<u64> {
 }
 fn ensure_frames(o: &process::Outcome, f: Fixture) -> io::Result<()> {
     if frames(&String::from_utf8_lossy(&o.stdout.bytes))? != u64::from(f.frames) {return Err(invalid("frame count mismatch"));}
+    let text=String::from_utf8_lossy(&o.stdout.bytes);
+    for key in ["dup_frames=","drop_frames="] {if text.lines().filter_map(|l|l.strip_prefix(key)).any(|v|v.trim().parse::<u64>().ok()!=Some(0)){return Err(invalid("frame duplication/drop"));}}
     Ok(())
 }
 fn listed(list: &str, name: &str) -> bool {
@@ -124,13 +134,18 @@ fn metric(o: &Options, f: Fixture, source: &Path, encoded: &Path, filter: &str, 
 }
 fn encode(o: &Options,f: Fixture,e: Encoder,preset: &str,source: &Path,out: &Path,cancel: &AtomicBool,record: &mut Value) -> io::Result<()> {
     let pix=if e.hardware {if f.bits==10 {"p010le"} else {"nv12"}} else {f.pix()};
-    let r=ff(&o.ffmpeg).args(["-v","error","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-vf",&format!("scale=iw:ih,format={pix}"),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
+    let r=ff(&o.ffmpeg).args(["-v","info","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-fps_mode","passthrough","-vf",&format!("scale=iw:ih,format={pix}"),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
     record["argv"]=json!(r.args.iter().map(|a|a.to_string_lossy()).collect::<Vec<_>>());
     let start=Instant::now();
-    let x=checked(&r,cancel);
+    let x=process::run(&r,cancel);
     let elapsed=start.elapsed().as_secs_f64();
     record["encode_wall_seconds"]=json!(elapsed);
     let x=x?;
+    record["encoder_log"]=json!(String::from_utf8_lossy(&x.stderr.bytes));
+    record["encoder_log_discarded_bytes"]=json!(x.stderr.discarded);
+    record["exit_code"]=json!(x.status.code());
+    record["stop"]=json!(format!("{:?}",x.stop));
+    if x.stop!=Stop::Exited||!x.status.success()||x.stdout.discarded!=0{return Err(io::Error::other(format!("encode {:?}: {}",x.stop,x.status)));}
     ensure_frames(&x,f)?;
     record["encoded_frames"]=json!(f.frames);
     record["fps"]=json!(f64::from(f.frames)/elapsed);
@@ -168,7 +183,7 @@ fn run_inner(o: &Options, root: &Path, cancel: &AtomicBool) -> io::Result<()> {
     let list=stdout(&request(&o.ffmpeg).args(["-hide_banner","-encoders"]),cancel)?;
     let probe_version=stdout(&request(&o.ffprobe).args(["-version"]),cancel)?;
     let env=json!({
-        "os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+        "os":std::env::consts::OS,"arch":std::env::consts::ARCH,"system_snapshot":system_snapshot(),
         "cpu":report.inventory.cpu,"logical_cpus":report.inventory.logical_cpus,
         "adapters":report.inventory.adapters.iter().map(|a|json!({"name":a.name,"driver_version":a.driver_version})).collect::<Vec<_>>(),
         "adapter_scan_complete":report.inventory.adapter_scan_complete,"adapter_scan_error":report.inventory.adapter_scan_error,
