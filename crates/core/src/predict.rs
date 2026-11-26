@@ -116,6 +116,13 @@ impl Database{
         if nvenc["schema_version"]!=1||nvenc["version"]!=nvenc::VERSION{return Err(bad("vendor reference schema"))}
         Ok(Self{official,local:Vec::new(),mapping,nvenc})
     }
+    pub(crate) fn from_official(text: &str) -> io::Result<Self> {
+        let official = parse(text, "official")?;
+        if official.is_empty() { return Err(bad("empty official update")); }
+        let mut db = Self::bundled()?;
+        db.official = official;
+        Ok(db)
+    }
     /// Reads a separate, explicit local file. No write, merge, download or learning.
     pub fn with_local(mut self,path:&Path)->io::Result<Self>{
         let local=parse(&read(path)?,"local")?;
