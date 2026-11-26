@@ -16,7 +16,7 @@ pub fn inventory()->Inventory {
     Inventory{cpu,logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete,adapter_scan_error}
 }
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub enum Evidence { NotListed, Verified, Failed, TimedOut }
+pub enum Evidence { NotListed, AdapterAbsent, Verified, Failed, TimedOut }
 #[derive(Debug,Clone)]
 pub struct Capability {pub encoder:String,pub bit_depth:u8,pub evidence:Evidence,pub diagnostic:String}
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -68,6 +68,42 @@ fn try_encoder(exe:&Path,name:&str,bits:u8,cancel:&AtomicBool)->io::Result<Capab
     Ok(Capability{encoder:name.into(),bit_depth:bits,evidence,diagnostic})
 }
 impl Detector{
+    /// Discover compiled hardware encoders and present adapters without encoding.
+    pub(crate) fn list_for_transcode(&mut self, exe: &Path, cancel: &AtomicBool) -> io::Result<Report> {
+        let exe = std::fs::canonicalize(exe)?;
+        let meta = std::fs::metadata(&exe)?;
+        let inv = inventory();
+        let tool = ToolFingerprint {
+            executable: exe.clone(),
+            size_bytes: meta.len(),
+            modified: meta.modified().ok(),
+        };
+        let listed_encoders = checked_text(&exe, &["-hide_banner", "-encoders"], cancel)?;
+        let version = checked_text(&exe, &["-version"], cancel)?;
+        let complete_pci_inventory = inv.adapter_scan_complete && inv.adapters.iter().all(|adapter| {
+            adapter.instance_id.as_deref().is_some_and(|id| id.starts_with("PCI\\VEN_"))
+        });
+        let capabilities = ENCODERS.iter().filter_map(|&(encoder, bit_depth)| {
+            let vendor = if encoder.ends_with("_nvenc") { "10DE" }
+                else if encoder.ends_with("_qsv") { "8086" }
+                else { "1002" };
+            let present = inv.adapters.iter().any(|adapter| {
+                adapter.instance_id.as_deref().and_then(|id| id.strip_prefix("PCI\\VEN_")).and_then(|id| id.get(..4))
+                    .is_some_and(|id| id.eq_ignore_ascii_case(vendor))
+            });
+            let compiled = listed(&listed_encoders, encoder);
+            let (evidence, diagnostic) = if !compiled {
+                (Evidence::NotListed, "encoder not compiled into this ffmpeg")
+            } else if complete_pci_inventory && !present {
+                (Evidence::AdapterAbsent, "matching PCI display adapter not present")
+            } else {
+                return None;
+            };
+            Some(Capability { encoder: encoder.into(), bit_depth, evidence, diagnostic: diagnostic.into() })
+        }).collect();
+        Ok(Report { inventory: inv, tool_version: version, tool, capabilities, cache_hit: false })
+    }
+
     /// Memory cache only, keyed by present adapters/driver, tool identity and CPU.
     /// Failed/timed-out probes are evidence of this attempt, not permanent unsupported claims.
     pub fn detect(&mut self,exe:&Path,cancel:&AtomicBool)->io::Result<Report>{

@@ -253,7 +253,7 @@ impl Observation {
     pub(crate) fn published(profile: Profile, result: Outcome) -> Self {
         let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX).max(1);
         Self {
-            source: "s06-verified-publication-v1".into(),
+            source: "s09-ffmpeg-publication-v1".into(),
             profile,
             total_us: micros(result.total),
             encode_us: micros(result.encode),
@@ -290,8 +290,10 @@ impl Observation {
 
     pub(crate) fn valid(&self) -> bool {
         let software = self.profile.encoder.starts_with("lib");
-        self.source == "s06-verified-publication-v1"
-            && self.profile.valid()
+        matches!(
+            self.source.as_str(),
+            "s06-verified-publication-v1" | "s09-ffmpeg-publication-v1"
+        ) && self.profile.valid()
             && self.encode_us > 0
             && self.total_us >= self.encode_us
             && (1..=self.profile.limit_bytes).contains(&self.bytes)

@@ -46,6 +46,7 @@ pub enum Reason {
     SmallProbeOnly,
     ProbeMissing,
     ProbeNotListed,
+    AdapterAbsent,
     ProbeFailed,
     ProbeTimedOut,
     RequestUnverified,
@@ -208,6 +209,7 @@ fn candidate<'a>(job: Job<'a>, route: Route, checks: &[RequestCheck<'a>]) -> Can
     let probe_result = match small_probe.map(|probe| &probe.evidence) {
         Some(Evidence::Verified) => Some((Capability::Pending, Reason::SmallProbeOnly)),
         Some(Evidence::NotListed) => Some((Capability::Unavailable, Reason::ProbeNotListed)),
+        Some(Evidence::AdapterAbsent) => Some((Capability::Unavailable, Reason::AdapterAbsent)),
         Some(Evidence::Failed) => Some((Capability::Unavailable, Reason::ProbeFailed)),
         Some(Evidence::TimedOut) => Some((Capability::Unavailable, Reason::ProbeTimedOut)),
         None if route != Route::Software => Some((Capability::Pending, Reason::ProbeMissing)),
@@ -450,6 +452,11 @@ pub fn decide<'a>(
 #[cfg(test)]
 thread_local! {
     static FIXTURE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_fallback() -> bool {
+    FIXTURE_FALLBACK.get()
 }
 
 #[cfg(test)]

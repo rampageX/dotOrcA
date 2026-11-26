@@ -42,8 +42,8 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
                 let channels = stream.channels.filter(|n| *n > 0).ok_or(Error::UnknownChannels)?;
                 audio_bps.push(channels.checked_mul(64_000).ok_or(Error::RateOverflow)?);
             }
-            // Unbudgeted attachments, subtitles, alternate video, or unknown data need mapping first.
-            _ => return Err(Error::UnsupportedStreams),
+            // Production maps the first non-cover video and all audio tracks.
+            _ => {}
         }
     }
     let source = video.ok_or(Error::UnsupportedStreams)?;
