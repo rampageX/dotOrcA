@@ -6,9 +6,15 @@ use std::{fs, io::{self, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicBoo
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
-fn system_snapshot()->Value {
+pub(crate) fn system_snapshot()->Value {
     #[cfg(windows)] { windows::snapshot() }
     #[cfg(not(windows))] { json!({"kernel_release":fs::read_to_string("/proc/sys/kernel/osrelease").ok().map(|s|s.trim().to_owned()),"os_release":fs::read_to_string("/etc/os-release").ok(),"memory":fs::read_to_string("/proc/meminfo").ok().map(|s|s.lines().take(3).collect::<Vec<_>>().join("\n"))}) }
+}
+
+/// System CPU occupancy sampled before encoding, not per-process attribution.
+pub(crate) fn pretest_cpu_busy()->Option<f64>{
+    #[cfg(windows)] {windows::pretest_cpu_busy()}
+    #[cfg(not(windows))] {None}
 }
 
 pub const SCHEMA: u32 = 1;
