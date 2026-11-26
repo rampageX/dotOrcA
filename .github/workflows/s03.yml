@@ -1,0 +1,55 @@
+name: S03 prediction acceptance
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prediction:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test --locked -p orca-core -p orca-benchmark
+      - name: Build and validate standalone predictor
+        shell: pwsh
+        run: |
+          if ($IsWindows) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
+          cargo build --locked --release -p orca-core --bin orca-predict
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = if ($IsWindows) { './target/release/orca-predict.exe' } else { './target/release/orca-predict' }
+          $info = & $exe --info | ConvertFrom-Json
+          if ($LASTEXITCODE -or $info.official_samples -ne 264 -or $info.official_datasets -ne 2 -or $info.local_samples -ne 0) { throw 'Invalid official dataset' }
+          $bad = Join-Path (Get-Location) 'S03 local & (黑洞) ^ % !.json'
+          [IO.File]::WriteAllText($bad,'[{"schema_version":999}]')
+          & $exe --info --local $bad
+          if ($LASTEXITCODE -eq 0) { throw 'Invalid local dataset accepted' }
+          Remove-Item -LiteralPath $bad
+          New-Item -ItemType Directory -Force dist-s03 | Out-Null
+          $info | ConvertTo-Json -Depth 20 | Out-File dist-s03/info.json
+      - name: Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item target/release/orca-predict.exe dist-s03/
+          Copy-Item Cargo.lock dist-s03/
+          Copy-Item data/official/*.json dist-s03/
+          git rev-parse HEAD | Out-File dist-s03/source-sha.txt
+          rustc -Vv | Out-File dist-s03/rustc.txt
+          Get-FileHash dist-s03/orca-predict.exe -Algorithm SHA256 | Format-List | Out-File dist-s03/sha256.txt
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents dist-s03/orca-predict.exe | Out-File dist-s03/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: dotOrcA-S03
+          path: dist-s03/
+          if-no-files-found: error
