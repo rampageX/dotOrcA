@@ -20,9 +20,15 @@ pub enum Evidence { NotListed, Verified, Failed, TimedOut }
 #[derive(Debug,Clone)]
 pub struct Capability {pub encoder:String,pub bit_depth:u8,pub evidence:Evidence,pub diagnostic:String}
 #[derive(Debug,Clone,PartialEq,Eq)]
-struct Fingerprint {exe:PathBuf,size:u64,modified:Option<SystemTime>,version:String,inventory:Inventory}
+pub struct ToolFingerprint {
+    pub executable: PathBuf,
+    pub size_bytes: u64,
+    pub modified: Option<SystemTime>,
+}
+#[derive(Debug,Clone,PartialEq,Eq)]
+struct Fingerprint {tool:ToolFingerprint,version:String,inventory:Inventory}
 #[derive(Debug,Clone)]
-pub struct Report {pub inventory:Inventory,pub tool_version:String,pub capabilities:Vec<Capability>,pub cache_hit:bool}
+pub struct Report {pub inventory:Inventory,pub tool_version:String,pub tool:ToolFingerprint,pub capabilities:Vec<Capability>,pub cache_hit:bool}
 #[derive(Default)]
 pub struct Detector {cache:Option<(Fingerprint,Instant,Report)>}
 const ENCODERS:[(&str,u8);18]=[
@@ -70,8 +76,8 @@ impl Detector{
         let meta=std::fs::metadata(&exe)?;
         let version=checked_text(&exe,&["-version"],cancel)?;
         let inv=inventory();
-        let key=Fingerprint{exe:exe.clone(),size:meta.len(),modified:meta.modified().ok(),version:version.clone(),inventory:inv.clone()};
-        let cacheable=inv.adapter_scan_complete&&inv.cpu.is_some()&&key.modified.is_some()&&inv.adapters.iter().all(|a|a.instance_id.is_some()&&a.driver_version.is_some());
+        let key=Fingerprint{tool:ToolFingerprint{executable:exe.clone(),size_bytes:meta.len(),modified:meta.modified().ok()},version:version.clone(),inventory:inv.clone()};
+        let cacheable=inv.adapter_scan_complete&&inv.cpu.is_some()&&key.tool.modified.is_some()&&inv.adapters.iter().all(|a|a.instance_id.is_some()&&a.driver_version.is_some());
         if cacheable {
             if let Some((old,at,report))=&self.cache {
                 let stable=report.capabilities.iter().all(|c|matches!(c.evidence,Evidence::Verified|Evidence::NotListed));
@@ -86,7 +92,7 @@ impl Detector{
             capabilities.push(if listed(&list,name){try_encoder(&exe,name,bits,cancel)?}
                 else{Capability{encoder:name.into(),bit_depth:bits,evidence:Evidence::NotListed,diagnostic:"encoder not compiled into this ffmpeg".into()}});
         }
-        let report=Report{inventory:inv,tool_version:version,capabilities,cache_hit:false};
+        let report=Report{inventory:inv,tool_version:version,tool:key.tool.clone(),capabilities,cache_hit:false};
         // A transient timeout or initialization failure must not be cached indefinitely.
         if cacheable{
             self.cache=Some((key,Instant::now(),report.clone()));

@@ -6,3 +6,4 @@ pub mod hardware;
 pub mod benchmark;
 pub mod predict;
 pub mod budget;
+pub mod decision;
