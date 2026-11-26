@@ -1,0 +1,82 @@
+name: S02 benchmark acceptance
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test --locked -p orca-core -p orca-benchmark
+      - name: Build standalone CLI
+        shell: pwsh
+        run: |
+          if ($IsWindows) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
+          $env:DOTORCA_SOURCE_SHA = git rev-parse HEAD
+          cargo build --locked --release -p orca-benchmark
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Install FFmpeg if needed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            if ($IsWindows) {
+              choco install ffmpeg --version=9.1.0 -y --no-progress
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              'C:\ProgramData\chocolatey\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+            } else {
+              sudo apt-get update
+              sudo apt-get install -y ffmpeg
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            }
+          }
+      - name: Smoke measurement
+        shell: pwsh
+        run: |
+          $exe = if ($IsWindows) { './target/release/orca-benchmark.exe' } else { './target/release/orca-benchmark' }
+          $ffmpeg = (Get-Command ffmpeg -CommandType Application).Source
+          $ffprobe = (Get-Command ffprobe -CommandType Application).Source
+          $root = Join-Path (Get-Location) 'S02 小K & (黑洞) ^ % !'
+          & $exe --smoke --repeats 1 --ffmpeg $ffmpeg --ffprobe $ffprobe --output $root
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $run = Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1
+          $r = Get-Content -LiteralPath (Join-Path $run.FullName 'report.json') -Raw | ConvertFrom-Json
+          if ($r.schema_version -ne 1 -or $r.matrix_version -ne 'synthetic-sdr-v1' -or $r.failures -ne 0 -or $r.cancelled) { throw 'Invalid report' }
+          if ($r.fixtures.Count -ne 2 -or $r.records.Count -ne 16) { throw 'Incomplete smoke matrix' }
+          $ok = @($r.records | Where-Object status -eq 'ok')
+          if (@($ok | Where-Object { $_.encoder -eq 'libx264' -and $_.bit_depth -eq 8 }).Count -ne 2) { throw 'x264 positive evidence missing' }
+          if (@($ok | Where-Object { $_.bit_depth -eq 10 }).Count -lt 1) { throw '10-bit positive evidence missing' }
+          foreach ($c in $ok) {
+            if ($c.encoded_frames -ne 12 -or $c.fps -le 0 -or $c.output_bytes -le 0 -or $c.actual_container_bitrate_bps -le 0 -or $null -eq $c.ssim -or $null -eq $c.psnr_db -or $c.output_sha256.Length -ne 64) { throw "Missing evidence: $($c.case_id)" }
+          }
+          if (Test-Path -LiteralPath (Join-Path $run.FullName 'work')) { throw 'Temporary files were not cleaned' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $run.FullName 'cases') -File).Count -ne 16) { throw 'Missing per-case records' }
+          New-Item -ItemType Directory -Force dist-s02 | Out-Null
+          Copy-Item -LiteralPath (Join-Path $run.FullName 'report.json') -Destination dist-s02/ci-smoke-report.json
+      - name: Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item target/release/orca-benchmark.exe dist-s02/
+          Copy-Item Cargo.lock dist-s02/
+          git rev-parse HEAD | Out-File dist-s02/source-sha.txt
+          rustc -Vv | Out-File dist-s02/rustc.txt
+          Get-FileHash dist-s02/orca-benchmark.exe -Algorithm SHA256 | Format-List | Out-File dist-s02/sha256.txt
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents dist-s02/orca-benchmark.exe | Out-File dist-s02/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: dotOrcA-S02
+          path: dist-s02/
+          if-no-files-found: error
