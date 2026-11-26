@@ -2,7 +2,6 @@ name: S00 Rust GUI arena
 on:
   push:
     branches: [test/s00-rust-gui-arena]
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        candidate: [winsafe, nwg, gpui]
+        candidate: [winsafe, nwg]
     defaults:
       run:
         working-directory: arena

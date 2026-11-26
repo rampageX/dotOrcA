@@ -1,0 +1,57 @@
+name: S00 CUI probe
+on:
+  push:
+    branches: [test/s00-cui]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: cui-probe
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build CUI static libraries
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build Rust integration
+        shell: pwsh
+        run: |
+          rustup default stable
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:CUI_LIB_DIR = (Resolve-Path build/lib).Path
+          cargo generate-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          $exe = 'target/x86_64-pc-windows-msvc/release/arena-cui.exe'
+          Copy-Item $exe ../dist/
+          Copy-Item Cargo.lock ../dist/
+          (Get-Item $exe).Length | Out-File ../dist/size-bytes.txt
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File ../dist/sha256.txt
+          rustc -Vv | Out-File ../dist/rustc.txt
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents $exe | Out-File ../dist/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path ../dist) '小K 的鹅腿坟场 & (黑洞) ^ % !.avi'), [byte[]]@())
+          $upstream = 'build/_deps/cui-src'
+          git -C $upstream rev-parse HEAD | Out-File ../dist/cui-source.txt
+          New-Item -ItemType Directory -Force ../dist/licenses | Out-Null
+          foreach ($f in @('LICENSE', 'THIRD_PARTY.md', 'assets/fonts/LICENSE-Inter.txt', 'assets/fonts/LICENSE-Geist.txt', 'assets/fonts/LICENSE-Lucide.txt', 'third_party/LICENSE-Unicode.txt')) {
+            Copy-Item (Join-Path $upstream $f) ../dist/licenses/
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arena-cui
+          path: dist/
+          if-no-files-found: error
