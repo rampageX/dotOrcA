@@ -83,6 +83,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         &AtomicBool::new(false),
         |event| {
             let event = match event {
+                Event::Source(_) => json!({"kind": "source_metadata"}),
+                Event::Plan(_) => json!({"kind": "capacity_plan"}),
                 Event::Decision(decision) => {
                     let plan = decision.job.plan;
                     if input_profile.is_null() {

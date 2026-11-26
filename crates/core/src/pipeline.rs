@@ -55,6 +55,8 @@ pub enum Error {
 
 #[derive(Debug)]
 pub enum Event<'a> {
+    Source(&'a MediaInfo),
+    Plan(&'a budget::Plan<'a>),
     Decision(&'a Decision<'a>),
     Preflight {
         route: Route,
@@ -450,6 +452,18 @@ pub fn encode(
     encode_inner(request, detector, cancel, observe, None, None)
 }
 
+/// GUI parallel mode uses the same production path without mixing
+/// concurrent timings into the serial learning dataset.
+pub fn encode_with_progress(
+    request: &EncodeRequest<'_>,
+    detector: &mut Detector,
+    cancel: &AtomicBool,
+    observe: impl FnMut(Event<'_>),
+    progress: Option<&(dyn Fn(u8) + Sync)>,
+) -> Result<Published, Error> {
+    encode_inner(request, detector, cancel, observe, None, progress)
+}
+
 #[derive(Debug)]
 pub struct TrackedPublication {
     pub output: Published,
@@ -506,6 +520,7 @@ fn encode_inner(
     let source_meta = fs::metadata(&source_path).map_err(|e| io_error(e, cancel))?;
     let source =
         media::probe(request.ffprobe, &source_path, cancel).map_err(|e| io_error(e, cancel))?;
+    observe(Event::Source(&source));
     let plan = budget::plan(
         &source,
         request.limit_bytes,
@@ -513,6 +528,7 @@ fn encode_inner(
         request.max_long_edge,
     )
     .map_err(Error::Budget)?;
+    observe(Event::Plan(&plan));
     if plan.source.hdr == Hdr::DolbyVision || timeline::dynamic_hdr(&plan.source.raw.to_string()) {
         return Err(Error::UnsupportedDynamicHdr);
     }

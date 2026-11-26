@@ -152,8 +152,8 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
         return -1;
     }
     boundary(|app| {
-        let (snapshot, clearing) = app.queue.as_ref().map_or_else(
-            || (Vec::new(), false), Queue::snapshot_with_clearing);
+        let (snapshot, clearing, slots) = app.queue.as_ref().map_or_else(
+            || (Vec::new(), false, 1), Queue::snapshot_status);
         app.snapshot = snapshot;
         let total = app.snapshot.len();
         let finished = app.snapshot.iter().filter(|j| j.phase.finished()).count();
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .snapshot
             .iter()
             .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
-        let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {skipped} skipped   |   {failed} failed   |   {} cancelled", finished - published - skipped - failed);
+        let mut text = format!("{finished}/{total} finished   |   {slots} slots   |   {published} saved   |   {skipped} skipped   |   {failed} failed   |   {} cancelled", finished - published - skipped - failed);
         if clearing {
             text.push_str("   |   Stopping and clearing all tasks…");
         }
@@ -265,6 +265,9 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
+        let phase = if let Some(reason) = &job.failure {
+            format!("{phase}: {reason}")
+        } else { phase.to_owned() };
         let mut status = format!("{phase}  |  Source {}", source_size(job));
         if let Some(settings) = job.settings {
             let target = match settings.target() {
@@ -335,9 +338,17 @@ pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usi
             text.push_str(&diagnostic_preview(error));
             text.push_str("\n\n");
         }
+        if let Some(reason) = &job.failure { text.push_str(&format!("Failure: {reason}\n\n")); }
         text.push_str(&format!("Source size: {}\nSource: {}", source_size(job), job.source.display()));
+        if let Some(info) = &job.source_info {
+            text.push_str(&format!("\n{info}"));
+        } else { text.push_str("\nSource media metadata not available."); }
+        if let Some(info) = &job.target_info { text.push_str(&format!("\n\nPlanned output: {info}")); }
+        if let Some(path) = &job.destination { text.push_str(&format!("\nDestination: {}", path.display())); }
         if let Some(output) = &job.output {
-            text.push_str(&format!("\nOutput: {}", output.display()));
+            text.push_str(&format!("\n\nSaved output: {}", output.display()));
+            if let Some(info) = &job.output_info { text.push_str(&format!("\n{info}")); }
+            else { text.push_str("\nActual output metadata unavailable."); }
         }
         for line in &job.detail {
             text.push('\n');

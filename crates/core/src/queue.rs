@@ -118,6 +118,11 @@ pub struct Job {
     pub detail: Vec<String>,
     pub encoder_error: Option<String>,
     pub retries: u32,
+    pub source_info: Option<String>,
+    pub target_info: Option<String>,
+    pub output_info: Option<String>,
+    pub failure: Option<String>,
+    pub destination: Option<PathBuf>,
 }
 
 struct Entry {
@@ -131,6 +136,8 @@ struct State {
     next: u32,
     closing: bool,
     clearing: bool,
+    active: Vec<(u32, String)>,
+    parallelism: usize,
 }
 
 #[derive(Default)]
@@ -148,9 +155,21 @@ pub struct Queue {
 impl Queue {
     pub fn portable(root: PathBuf) -> io::Result<Self> {
         Self::spawn(move |shared| {
-            let mut detector = Detector::default();
-            work(shared, |job, cancel, update| {
-                encode(&root, &mut detector, job, cancel, update)
+            let parallelism = crate::hardware::queue_parallelism(&crate::hardware::inventory());
+            {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.parallelism = parallelism;
+            }
+            thread::scope(|scope| {
+                for _ in 0..parallelism {
+                    let root = &root;
+                    scope.spawn(move || {
+                        let mut detector = Detector::default();
+                        work(shared, |job, cancel, update| {
+                            encode(root, &mut detector, job, cancel, update)
+                        });
+                    });
+                }
             });
         })
     }
@@ -232,6 +251,11 @@ impl Queue {
                 detail: Vec::new(),
                 encoder_error: None,
                 retries: 0,
+                source_info: None,
+                target_info: None,
+                output_info: None,
+                failure: None,
+                destination: None,
             }),
             cancel: Arc::new(AtomicBool::new(false)),
         });
@@ -254,7 +278,7 @@ impl Queue {
                 job.phase = Phase::Ready;
             }
         }
-        self.shared.ready.notify_one();
+        self.shared.ready.notify_all();
         Ok(())
     }
 
@@ -263,11 +287,14 @@ impl Queue {
     }
 
     pub fn snapshot_with_clearing(&self) -> (Vec<Arc<Job>>, bool) {
+        let (jobs, clearing, _) = self.snapshot_status();
+        (jobs, clearing)
+    }
+
+    pub fn snapshot_status(&self) -> (Vec<Arc<Job>>, bool, usize) {
         let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            state.entries.iter().map(|entry| Arc::clone(&entry.view)).collect(),
-            state.clearing,
-        )
+        (state.entries.iter().map(|entry| Arc::clone(&entry.view)).collect(),
+            state.clearing, state.parallelism.max(1))
     }
 
     pub fn cancel(&self, id: u32) {
@@ -314,7 +341,7 @@ impl Queue {
             for entry in &mut state.entries {
                 cancel_entry(entry);
             }
-            self.shared.ready.notify_one();
+            self.shared.ready.notify_all();
             self.shared.size_ready.notify_one();
         }
         // Do not join a metadata call that may be blocked by an offline UNC
@@ -378,6 +405,10 @@ impl Updates<'_> {
     }
 }
 
+fn output_key(source: &Path) -> String {
+    source.file_stem().unwrap_or_default().to_string_lossy().to_lowercase()
+}
+
 fn work(shared: &Shared, mut run: impl FnMut(&Job, &AtomicBool, &Updates<'_>)) {
     loop {
         let (job, cancel) = {
@@ -386,23 +417,43 @@ fn work(shared: &Shared, mut run: impl FnMut(&Job, &AtomicBool, &Updates<'_>)) {
                 if state.closing {
                     return;
                 }
-                if let Some(entry) = state
-                    .entries
-                    .iter_mut()
-                    .find(|e| e.view.phase == Phase::Ready)
-                {
+                if let Some(index) = state.entries.iter().position(|e| {
+                    e.view.phase == Phase::Ready && !state.active.iter()
+                        .any(|(_, name)| *name == output_key(&e.view.source))
+                }) {
+                    let entry = &mut state.entries[index];
                     Arc::make_mut(&mut entry.view).phase = Phase::Inspecting;
-                    break (Arc::clone(&entry.view), Arc::clone(&entry.cancel));
+                    let pair = (Arc::clone(&entry.view), Arc::clone(&entry.cancel));
+                    state.active.push((pair.0.id, output_key(&pair.0.source)));
+                    break pair;
                 }
                 state = shared.ready.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         };
-        run(&job, &cancel, &Updates { shared, id: job.id });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(&job, &cancel, &Updates { shared, id: job.id });
+        }));
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.clearing {
+        state.active.retain(|(id, _)| *id != job.id);
+        if result.is_err() {
+            state.closing = true;
+            for entry in &mut state.entries {
+                if entry.view.id == job.id {
+                    let view = Arc::make_mut(&mut entry.view);
+                    view.phase = Phase::Failed;
+                    view.failure = Some("Queue worker stopped unexpectedly.".into());
+                } else {
+                    cancel_entry(entry);
+                }
+            }
+            shared.size_ready.notify_one();
+        }
+        if state.clearing && state.active.is_empty() {
             state.entries.clear();
             state.clearing = false;
         }
+        shared.ready.notify_all();
+        if result.is_err() { return; }
     }
 }
 
@@ -425,6 +476,17 @@ fn observe(job: &mut Job, event: Event<'_>) {
         return;
     }
     match event {
+        Event::Source(source) => job.source_info = Some(media_summary(source)),
+        Event::Plan(plan) => {
+            let interlaced = matches!(plan.source.raw["field_order"].as_str(), Some("tt" | "bb" | "tb" | "bt"));
+            job.target_info = Some(format!(
+                "{:?} | {} × {} | {} | {:?} | {} | Video {:.0} kb/s | Audio tracks {}",
+                plan.codec, plan.width, plan.height,
+                plan.source.bit_depth.map_or_else(|| "unknown depth".into(), |n| format!("{n}-bit")),
+                plan.source.hdr, if interlaced { "BWDIF 2× cadence" } else { "Original cadence" },
+                plan.video_bps as f64 / 1000.0, plan.audio_bps.len()
+            ));
+        }
         Event::Decision(decision) => {
             job.phase = Phase::Preflight;
             job.progress_percent = None;
@@ -502,6 +564,36 @@ fn observe(job: &mut Job, event: Event<'_>) {
     }
 }
 
+fn media_summary(info: &crate::media::MediaInfo) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("Container: {} | Duration: {}",
+        info.format.as_deref().unwrap_or("unknown"),
+        info.duration_us.map_or_else(|| "unknown".into(), |n| format!("{:.2} s", n as f64 / 1_000_000.0))));
+    for s in &info.streams {
+        let codec = s.codec.as_deref().unwrap_or("unknown");
+        match s.kind.as_deref() {
+            Some("video") if !s.attached_picture => {
+                let fps = s.avg_rate.map_or_else(|| "unknown fps".into(), |r| format!("{:.3} fps (average)", r.numerator as f64 / r.denominator as f64));
+                lines.push(format!("Video: {codec} | {} × {} | {} | {fps} | {:?} | {}",
+                    s.width.map_or_else(|| "?".into(), |n| n.to_string()),
+                    s.height.map_or_else(|| "?".into(), |n| n.to_string()),
+                    s.bit_depth.map_or_else(|| "unknown depth".into(), |n| format!("{n}-bit")),
+                    s.hdr, s.pixel_format.as_deref().unwrap_or("unknown pixel format")));
+                lines.push(format!("Color: {} / {} / {} / {} | Field order: {}",
+                    s.color_primaries.as_deref().unwrap_or("unknown"), s.color_transfer.as_deref().unwrap_or("unknown"),
+                    s.color_space.as_deref().unwrap_or("unknown"), s.color_range.as_deref().unwrap_or("unknown"),
+                    s.raw["field_order"].as_str().unwrap_or("unknown")));
+            }
+            Some("audio") => lines.push(format!("Audio: {codec} | {} channels | {} Hz",
+                s.channels.map_or_else(|| "?".into(), |n| n.to_string()),
+                s.sample_rate.map_or_else(|| "?".into(), |n| n.to_string()))),
+            Some("subtitle") => lines.push(format!("Subtitle: {codec}")),
+            _ => {}
+        }
+    }
+    lines.join("\n")
+}
+
 fn encode(
     root: &Path,
     detector: &mut Detector,
@@ -555,11 +647,9 @@ fn encode(
             .to_os_string();
         name.push(".mp4");
         let destination = dir.join(name);
-        match fs::symlink_metadata(&destination) {
-            Ok(_) => return Err(pipeline::Error::DestinationExists),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(pipeline::Error::Io(e)),
-        }
+        update.modify(|job| job.destination = Some(destination.clone()));
+        // The pipeline's existing no-overwrite checks remain authoritative.
+        // Let the source/plan metadata reach Details before a name conflict.
         let tool = |name: &str| {
             root.join("tools")
                 .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
@@ -574,9 +664,7 @@ fn encode(
                 )));
             }
         }
-        let store = Store::portable(root).map_err(pipeline::Error::Io)?;
-        pipeline::encode_and_learn_with_progress(
-            &EncodeRequest {
+        let request = EncodeRequest {
                 source: &job.source,
                 destination: &destination,
                 ffmpeg: &ffmpeg,
@@ -585,21 +673,26 @@ fn encode(
                 codec: job.settings.expect("started job").codec,
                 max_long_edge: job.settings.expect("started job").max_long_edge,
                 timeout: Duration::from_secs(86_400),
-            },
-            detector,
-            cancel,
-            |event| {
-                update.modify(|job| observe(job, event));
-            },
-            &store,
-            Some(&|percent| {
-                update.modify(|job| {
-                    if job.phase == Phase::Encoding {
-                        job.progress_percent = Some(percent);
-                    }
-                });
-            }),
-        ).map(Some)
+        };
+        let observer = |event| { update.modify(|job| observe(job, event)); };
+        let report = |percent| { update.modify(|job| {
+            if job.phase == Phase::Encoding { job.progress_percent = Some(percent); }
+        }); };
+        let parallel = update.shared.state.lock().unwrap_or_else(|e| e.into_inner()).parallelism > 1;
+        let publication = if parallel {
+            let output = pipeline::encode_with_progress(&request, detector, cancel, observer, Some(&report))?;
+            pipeline::TrackedPublication { output, learning: Ok(()) }
+        } else {
+            let store = Store::portable(root).map_err(pipeline::Error::Io)?;
+            pipeline::encode_and_learn_with_progress(&request, detector, cancel, observer, &store, Some(&report))?
+        };
+        // One metadata-only read of the saved container, never a frame scan.
+        // This is presentation only and cannot turn a saved output into failure.
+        match crate::media::probe(&ffprobe, &publication.output.path, cancel) {
+            Ok(info) => { update.modify(|job| job.output_info = Some(media_summary(&info))); }
+            Err(error) => { update.modify(|job| note(job, format!("Output metadata unavailable: {error}"))); }
+        }
+        Ok(Some(publication))
     })();
     if let Some(mut completed) = update.modify(|current| current.clone()) {
         let job = &mut completed;
@@ -639,11 +732,11 @@ fn encode(
                 let detail = match error {
                     pipeline::Error::Process(detail) => {
                         job.encoder_error = Some(detail);
-                        "FFmpeg/process failed. See diagnostic above.".into()
+                        "FFmpeg/process failed".into()
                     }
                     pipeline::Error::HardwareRouteUnavailable => "No compatible hardware route. See the preflight or encoding failure details.".into(),
                     pipeline::Error::DestinationExists => {
-                        "Output conflict: a file with this name already exists in output/.".into()
+                        "Output conflict: destination already exists (not overwritten).".into()
                     }
                     pipeline::Error::Io(error)
                         if error.kind() == io::ErrorKind::PermissionDenied =>
@@ -653,6 +746,7 @@ fn encode(
                     pipeline::Error::Io(error) => error.to_string(),
                     other => format!("{other:?}"),
                 };
+                job.failure = Some(detail.clone());
                 note(job, detail);
             }
         }
@@ -706,6 +800,53 @@ mod tests {
             assert!(Instant::now() < deadline, "{jobs:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn two_workers_cancel_and_clear_only_after_both_return() {
+        let (tx, rx) = mpsc::channel();
+        let (release_a, wait_a) = mpsc::channel();
+        let (release_b, wait_b) = mpsc::channel();
+        let waits = [Mutex::new(wait_a), Mutex::new(wait_b)];
+        let queue = Queue::spawn(move |shared| {
+            thread::scope(|scope| {
+                for (i, wait) in waits.iter().enumerate() {
+                    let tx = tx.clone();
+                    scope.spawn(move || work(shared, |job, cancel, update| {
+                        tx.send((i, job.id)).unwrap();
+                        wait.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+                        assert!(cancel.load(Ordering::Acquire));
+                        update.modify(|job| job.phase = Phase::Cancelled);
+                    }));
+                }
+            });
+        }).unwrap();
+        let root = std::env::temp_dir();
+        let a = queue.add(&root.join("a.mp4")).unwrap();
+        let b = queue.add(&root.join("b.mp4")).unwrap();
+        let duplicate = queue.add(&root.join("a.mkv")).unwrap();
+        queue.start(settings()).unwrap();
+        let mut ids = [rx.recv_timeout(Duration::from_secs(5)).unwrap().1,
+                       rx.recv_timeout(Duration::from_secs(5)).unwrap().1];
+        ids.sort();
+        assert_eq!(ids, [a, b]);
+        assert_eq!(queue.snapshot().iter().find(|j| j.id == duplicate).unwrap().phase, Phase::Ready);
+        queue.clear_all();
+        release_a.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !queue.snapshot().iter().any(|j| j.id != duplicate && j.phase == Phase::Cancelled) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(queue.is_clearing());
+        assert_eq!(queue.snapshot().len(), 3);
+        release_b.send(()).unwrap();
+        while queue.is_clearing() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(queue.snapshot().is_empty());
+        queue.shutdown();
     }
 
     #[test]

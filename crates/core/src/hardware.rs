@@ -15,6 +15,47 @@ pub fn inventory()->Inventory {
     #[cfg(not(windows))] let cpu=std::env::var("PROCESSOR_IDENTIFIER").ok();
     Inventory{cpu,logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete,adapter_scan_error}
 }
+/// Conservative job slots from the detected adapter model and NVIDIA's
+/// physical NVENC count, not the driver session limit. Unknown models and
+/// ambiguous multiple NVIDIA adapters stay serial.
+/// https://developer.nvidia.com/video-encode-decode-support-matrix
+pub fn queue_parallelism(inv: &Inventory) -> usize {
+    if !inv.adapter_scan_complete { return 1; }
+    let mut nvidia = inv.adapters.iter().filter(|a| a.instance_id.as_deref()
+        .is_some_and(|id| id.to_ascii_uppercase().starts_with("PCI\\VEN_10DE")));
+    let Some(adapter) = nvidia.next() else { return 1; };
+    if nvidia.next().is_some() { return 1; }
+    let Some(name) = adapter.name.as_deref() else { return 1; };
+    let name = name.trim().to_ascii_lowercase();
+    let name = name.strip_prefix("nvidia ").unwrap_or(&name);
+    let name = name.strip_suffix(" laptop gpu").map(|s| format!("{s} laptop"))
+        .unwrap_or_else(|| name.to_owned());
+    if matches!(name.as_str(),
+        "geforce rtx 4070 ti" | "geforce rtx 4070 ti super" |
+        "geforce rtx 4080" | "geforce rtx 4080 16gb" | "geforce rtx 4080 super" |
+        "geforce rtx 4080 laptop" | "geforce rtx 4090" | "geforce rtx 4090 laptop" |
+        "geforce rtx 5070 ti" | "geforce rtx 5080" | "geforce rtx 5080 laptop" |
+        "geforce rtx 5090" | "geforce rtx 5090 laptop" |
+        "rtx 6000 ada generation" | "l40") { 2 } else { 1 }
+}
+
+#[cfg(test)]
+#[test]
+fn queue_parallelism_requires_known_physical_engines() {
+    let mut inv = Inventory { cpu: None, logical_cpus: None, adapters: vec![
+        Adapter { name: Some("NVIDIA GeForce RTX 4080".into()), instance_id: Some("PCI\\VEN_10DE&DEV_2704".into()), driver_version: None }
+    ], adapter_scan_complete: true, adapter_scan_error: None };
+    assert_eq!(queue_parallelism(&inv), 2);
+    inv.adapters[0].name = Some("NVIDIA T600".into());
+    assert_eq!(queue_parallelism(&inv), 1);
+    inv.adapters[0].name = Some("NVIDIA GeForce RTX 5070 Ti Laptop GPU".into());
+    assert_eq!(queue_parallelism(&inv), 1);
+    inv.adapters[0].name = Some("NVIDIA GeForce RTX 4080 Laptop GPU".into());
+    assert_eq!(queue_parallelism(&inv), 2);
+    inv.adapters.push(inv.adapters[0].clone());
+    assert_eq!(queue_parallelism(&inv), 1);
+}
+
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub enum Evidence { NotListed, AdapterAbsent, Verified, Failed, TimedOut }
 #[derive(Debug,Clone)]
