@@ -674,7 +674,7 @@ fn encode(
                 max_long_edge: job.settings.expect("started job").max_long_edge,
                 timeout: Duration::from_secs(86_400),
         };
-        let observer = |event| { update.modify(|job| observe(job, event)); };
+        let observer = |event: Event<'_>| { update.modify(|job| observe(job, event)); };
         let report = |percent| { update.modify(|job| {
             if job.phase == Phase::Encoding { job.progress_percent = Some(percent); }
         }); };
@@ -1108,7 +1108,11 @@ mod tests {
         );
         assert!(jobs[0].eta.is_none());
         assert_eq!(jobs[1].phase, Phase::Failed);
-        assert!(jobs[1].detail.last().unwrap().contains("Output conflict"));
+        assert!(jobs[1].failure.as_deref().unwrap().contains("Output conflict"));
+        assert!(jobs[1].destination.is_some());
+        assert!(jobs[0].source_info.as_deref().unwrap().contains("320 × 180"));
+        assert!(jobs[0].target_info.as_deref().unwrap().contains("256 × 144"));
+        assert!(jobs[0].output_info.as_deref().unwrap().contains("256 × 144"));
         assert_eq!(jobs[2].phase, Phase::Failed);
         assert_eq!(jobs[3].phase, Phase::Cancelled);
         assert!(source.exists());
