@@ -14,12 +14,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Bootstrap lockfile (temporary)
-        shell: pwsh
-        run: |
-          cargo generate-lockfile
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Get-Content Cargo.lock
       - run: cargo test --locked -p orca-core
       - name: Build and process self-test
         shell: pwsh
@@ -42,6 +36,8 @@ jobs:
           $ffmpeg = (Get-Command ffmpeg -CommandType Application).Source
           $ffprobe = (Get-Command ffprobe -CommandType Application).Source
           & ./target/release/dotorca-s01.exe --ci-media --ffmpeg $ffmpeg --ffprobe $ffprobe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & ./target/release/dotorca-s01.exe --ffmpeg $ffmpeg --ffprobe $ffprobe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Windows artifact
         if: runner.os == 'Windows'

@@ -145,7 +145,7 @@ fn run()->io::Result<()> {
     let suffix=std::env::consts::EXE_SUFFIX;
     let mut ffmpeg=root.join("tools").join(format!("ffmpeg{suffix}"));
     let mut ffprobe=root.join("tools").join(format!("ffprobe{suffix}"));
-    let mut media_paths=Vec::new();let mut detect=true;let mut fixtures=false;
+    let mut media_paths=Vec::new();let mut detect=true;let mut fixtures=false;let mut repeat=false;
     let mut i=0;
     while i<args.len(){
         match args[i].to_str(){
@@ -154,9 +154,10 @@ fn run()->io::Result<()> {
                 match args[i].to_str().unwrap(){"--ffmpeg"=>ffmpeg=absolute(v.into())?,"--ffprobe"=>ffprobe=absolute(v.into())?,_=>media_paths.push(PathBuf::from(v))}
                 i+=2;
             }
+            Some("--repeat-hardware")=>{repeat=true;i+=1;}
             Some("--ci-media")=>{fixtures=true;i+=1;}
             Some("--no-hardware")=>{detect=false;i+=1;}
-            Some("--help")=>{println!("dotorca-s01 [--self-test] [--ffmpeg PATH] [--ffprobe PATH] [--no-hardware] [--media FILE ...]\nDefault tools directory is next to EXE. No source files are modified.");return Ok(());}
+            Some("--help")=>{println!("dotorca-s01 [--self-test] [--ffmpeg PATH] [--ffprobe PATH] [--no-hardware] [--repeat-hardware] [--media FILE ...]\nDefault tools directory is next to EXE. No source files are modified.");return Ok(());}
             _=>{media_paths.push(PathBuf::from(&args[i]));i+=1;}
         }
     }
@@ -173,8 +174,9 @@ fn run()->io::Result<()> {
     }
     if detect{
         let mut detector=hardware::Detector::default();
-        let inv=hardware::inventory();println!("INVENTORY: {inv:#?}");
         let report=detector.detect(&ffmpeg,&cancel)?;
+        println!("INVENTORY: {:#?}",report.inventory);
+        if repeat {let again=detector.detect(&ffmpeg,&cancel)?;println!("SECOND DETECTION cache_hit={}",again.cache_hit); }
         println!("FFmpeg: {}",report.tool_version.lines().next().unwrap_or("unknown"));
         for c in report.capabilities{println!("{} {}-bit {:?}: {}",c.encoder,c.bit_depth,c.evidence,c.diagnostic.trim());}
     }

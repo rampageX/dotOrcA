@@ -51,3 +51,18 @@ pub fn adapters()->io::Result<Vec<Adapter>>{
         Ok(result)
     }
 }
+
+#[link(name="advapi32")]
+extern "system"{
+    fn RegGetValueW(key:Handle,subkey:*const u16,value:*const u16,flags:u32,kind:*mut u32,data:*mut c_void,len:*mut u32)->i32;
+}
+pub fn cpu_name()->Option<String>{
+    let sub:Vec<u16>=r"HARDWARE\DESCRIPTION\System\CentralProcessor\0".encode_utf16().chain(Some(0)).collect();
+    let value:Vec<u16>="ProcessorNameString".encode_utf16().chain(Some(0)).collect();
+    let mut buf=[0u16;256];
+    let mut bytes=(buf.len()*2) as u32;
+    // SAFETY: HKLM is a documented predefined handle, inputs are NUL terminated,
+    // output is initialized, aligned and bounded by bytes.
+    let code=unsafe{RegGetValueW(0x80000002u32 as i32 as isize as Handle,sub.as_ptr(),value.as_ptr(),2,null_mut(),buf.as_mut_ptr().cast(),&mut bytes)};
+    if code==0{decode(&buf).map(|s|s.trim().to_owned())}else{None}
+}

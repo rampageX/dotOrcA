@@ -87,7 +87,7 @@ mod win {
     }
 }
 #[cfg(windows)]
-pub use win::{spawn,Tree};
+pub use win::spawn;
 
 #[cfg(unix)]
 mod unix {
@@ -109,4 +109,4 @@ mod unix {
     }
 }
 #[cfg(unix)]
-pub use unix::{spawn,Tree};
+pub use unix::spawn;

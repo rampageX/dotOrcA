@@ -1,17 +1,19 @@
 //! Capability evidence, not encoder policy. No throughput prediction.
 use crate::process::{self,Request,Stop};
-use std::{io,path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Duration,SystemTime}};
+use std::{io,path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant,SystemTime}};
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct Adapter {pub name:Option<String>,pub instance_id:Option<String>,pub driver_version:Option<String>}
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub struct Inventory {pub cpu:Option<String>,pub logical_cpus:Option<usize>,pub adapters:Vec<Adapter>,pub adapter_scan_complete:bool}
+pub struct Inventory {pub cpu:Option<String>,pub logical_cpus:Option<usize>,pub adapters:Vec<Adapter>,pub adapter_scan_complete:bool,pub adapter_scan_error:Option<String>}
 pub fn inventory()->Inventory {
-    #[cfg(windows)] let (adapters,adapter_scan_complete)=match windows::adapters(){Ok(a)=>(a,true),Err(_)=>(Vec::new(),false)};
-    #[cfg(not(windows))] let (adapters,adapter_scan_complete)=(Vec::new(),false);
-    Inventory{cpu:std::env::var("PROCESSOR_IDENTIFIER").ok(),logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete}
+    #[cfg(windows)] let (adapters,adapter_scan_complete,adapter_scan_error)=match windows::adapters(){Ok(a)=>(a,true,None),Err(e)=>(Vec::new(),false,Some(e.to_string()))};
+    #[cfg(not(windows))] let (adapters,adapter_scan_complete,adapter_scan_error)=(Vec::new(),false,Some("Windows adapter inventory unavailable on this platform".into()));
+    #[cfg(windows)] let cpu=windows::cpu_name().or_else(||std::env::var("PROCESSOR_IDENTIFIER").ok());
+    #[cfg(not(windows))] let cpu=std::env::var("PROCESSOR_IDENTIFIER").ok();
+    Inventory{cpu,logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete,adapter_scan_error}
 }
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub enum Evidence { NotListed, Verified, Failed, TimedOut }
@@ -20,13 +22,13 @@ pub struct Capability {pub encoder:String,pub bit_depth:u8,pub evidence:Evidence
 #[derive(Debug,Clone,PartialEq,Eq)]
 struct Fingerprint {exe:PathBuf,size:u64,modified:Option<SystemTime>,version:String,inventory:Inventory}
 #[derive(Debug,Clone)]
-pub struct Report {pub inventory:Inventory,pub tool_version:String,pub capabilities:Vec<Capability>}
+pub struct Report {pub inventory:Inventory,pub tool_version:String,pub capabilities:Vec<Capability>,pub cache_hit:bool}
 #[derive(Default)]
-pub struct Detector {cache:Option<(Fingerprint,Report)>}
-const ENCODERS:[(&str,u8);15]=[
-    ("h264_nvenc",8),("hevc_nvenc",8),("hevc_nvenc",10),("av1_nvenc",8),("av1_nvenc",10),
-    ("h264_qsv",8),("hevc_qsv",8),("hevc_qsv",10),("av1_qsv",8),("av1_qsv",10),
-    ("h264_amf",8),("hevc_amf",8),("hevc_amf",10),("av1_amf",8),("av1_amf",10),
+pub struct Detector {cache:Option<(Fingerprint,Instant,Report)>}
+const ENCODERS:[(&str,u8);18]=[
+    ("h264_nvenc",8),("h264_nvenc",10),("hevc_nvenc",8),("hevc_nvenc",10),("av1_nvenc",8),("av1_nvenc",10),
+    ("h264_qsv",8),("h264_qsv",10),("hevc_qsv",8),("hevc_qsv",10),("av1_qsv",8),("av1_qsv",10),
+    ("h264_amf",8),("h264_amf",10),("hevc_amf",8),("hevc_amf",10),("av1_amf",8),("av1_amf",10),
 ];
 fn checked_text(exe:&Path,args:&[&str],cancel:&AtomicBool)->io::Result<String>{
     let o=process::run(&Request::new(exe).args(args.iter().copied()),cancel)?;
@@ -71,7 +73,10 @@ impl Detector{
         let key=Fingerprint{exe:exe.clone(),size:meta.len(),modified:meta.modified().ok(),version:version.clone(),inventory:inv.clone()};
         let cacheable=inv.adapter_scan_complete&&inv.cpu.is_some()&&key.modified.is_some()&&inv.adapters.iter().all(|a|a.instance_id.is_some()&&a.driver_version.is_some());
         if cacheable {
-            if let Some((old,report))=&self.cache {if old==&key{return Ok(report.clone());}}
+            if let Some((old,at,report))=&self.cache {
+                let stable=report.capabilities.iter().all(|c|matches!(c.evidence,Evidence::Verified|Evidence::NotListed));
+                if old==&key&&(stable||at.elapsed()<Duration::from_secs(60)) {let mut hit=report.clone();hit.cache_hit=true;return Ok(hit);}
+            }
         }
         self.cache=None;
         let list=checked_text(&exe,&["-hide_banner","-encoders"],cancel)?;
@@ -81,10 +86,10 @@ impl Detector{
             capabilities.push(if listed(&list,name){try_encoder(&exe,name,bits,cancel)?}
                 else{Capability{encoder:name.into(),bit_depth:bits,evidence:Evidence::NotListed,diagnostic:"encoder not compiled into this ffmpeg".into()}});
         }
-        let report=Report{inventory:inv,tool_version:version,capabilities};
+        let report=Report{inventory:inv,tool_version:version,capabilities,cache_hit:false};
         // A transient timeout or initialization failure must not be cached indefinitely.
-        if cacheable&&report.capabilities.iter().all(|c|matches!(c.evidence,Evidence::Verified|Evidence::NotListed)){
-            self.cache=Some((key,report.clone()));
+        if cacheable{
+            self.cache=Some((key,Instant::now(),report.clone()));
         }
         Ok(report)
     }
