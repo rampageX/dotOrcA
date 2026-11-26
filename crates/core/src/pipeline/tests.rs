@@ -289,8 +289,6 @@ fn production_special_path_vfr_audio_and_hdr() {
             "mpeg2video",
             "-flags:v",
             "+ilme+ildct",
-            "-top",
-            "1",
             "-c:s",
             "srt",
         ])
