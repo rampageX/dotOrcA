@@ -395,6 +395,10 @@ pub fn decide<'a>(
         .filter(|c| c.capability == Capability::Ready)
         .map(|c| c.route);
     let mut proactive_denials = software_denials(job, comparator, evidence);
+    // CPU-only CI can explicitly exercise software encoding and publication.
+    let allow_fallback = false;
+    #[cfg(test)]
+    let allow_fallback = allow_fallback || FIXTURE_FALLBACK.get();
     if software.capability != Capability::Ready {
         proactive_denials.push(Reason::SoftwareRequestUnverified);
     }
@@ -419,7 +423,7 @@ pub fn decide<'a>(
             Selection::ProactiveSoftware
         }
         Some(hardware) => Selection::DefaultHardware(hardware.route),
-        None if software.capability != Capability::Unavailable => {
+        None if software.capability != Capability::Unavailable && allow_fallback => {
             let reason = if hardware_candidates
                 .iter()
                 .any(|c| c.reasons.contains(&Reason::ExecutionFailed))
@@ -441,6 +445,16 @@ pub fn decide<'a>(
         proactive_denials,
         software_evidence: evidence,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIXTURE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn allow_fixture_fallback() {
+    FIXTURE_FALLBACK.set(true);
 }
 
 #[cfg(test)]

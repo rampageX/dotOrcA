@@ -240,11 +240,8 @@ fn small_probe_only_sets_order_and_exact_request_checks_preserve_constraints() {
         check(job, Route::Software, CheckResult::Compatible),
     ];
     let d = decide(Ok(&plan), &hardware, &checks, None).unwrap();
-    assert_eq!(
-        d.selection,
-        Selection::SoftwareFallback(FallbackReason::HardwareUnavailable)
-    );
-    assert_eq!(d.ready_route(), Some(Route::Software));
+    assert_eq!(d.selection, Selection::NoRoute);
+    assert_eq!(d.ready_route(), None);
     assert_eq!(d.candidates[3].encoder, "libx265");
     assert_eq!(
         d.job.plan.source.color_transfer.as_deref(),
@@ -253,15 +250,12 @@ fn small_probe_only_sets_order_and_exact_request_checks_preserve_constraints() {
 }
 
 #[test]
-fn unavailable_and_failed_hardware_have_distinct_fallbacks() {
+fn unavailable_and_failed_hardware_do_not_fall_back_to_software() {
     let media = source("yuv420p", "bt709");
     let plan = budget::plan(&media, 200_000_000, Codec::Hevc, 1920).unwrap();
     let unavailable = report(Evidence::NotListed, 8);
     let d = decide(Ok(&plan), &unavailable, &[], None).unwrap();
-    assert_eq!(
-        d.selection,
-        Selection::SoftwareFallback(FallbackReason::HardwareUnavailable)
-    );
+    assert_eq!(d.selection, Selection::NoRoute);
     assert_eq!(d.ready_route(), None);
 
     let mut hardware = report(Evidence::Verified, 8);
@@ -283,11 +277,8 @@ fn unavailable_and_failed_hardware_have_distinct_fallbacks() {
     let mut all_failed = checks.to_vec();
     all_failed.push(check(job, Route::Qsv, CheckResult::ExecutionFailed));
     let d = decide(Ok(&plan), &hardware, &all_failed, None).unwrap();
-    assert_eq!(
-        d.selection,
-        Selection::SoftwareFallback(FallbackReason::HardwareExecutionFailed)
-    );
-    assert_eq!(d.ready_route(), Some(Route::Software));
+    assert_eq!(d.selection, Selection::NoRoute);
+    assert_eq!(d.ready_route(), None);
     all_failed.push(check(job, Route::Software, CheckResult::Incompatible));
     let d = decide(Ok(&plan), &hardware, &all_failed, None).unwrap();
     assert_eq!(d.selection, Selection::NoRoute);

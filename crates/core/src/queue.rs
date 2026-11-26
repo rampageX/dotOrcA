@@ -488,6 +488,7 @@ fn encode(
             Err(error) => {
                 job.phase = Phase::Failed;
                 let detail = match error {
+                    pipeline::Error::HardwareRouteUnavailable => "No compatible hardware route. See the preflight or encoding failure details.".into(),
                     pipeline::Error::DestinationExists => {
                         "Output conflict: a file with this name already exists in output/.".into()
                     }
@@ -631,7 +632,15 @@ mod tests {
         )
         .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
-        let queue = Queue::portable(root.clone()).unwrap();
+        let queue_root = root.clone();
+        let queue = Queue::spawn(move |shared| {
+            crate::decision::allow_fixture_fallback();
+            let mut detector = Detector::default();
+            work(shared, |job, cancel, update| {
+                encode(&queue_root, &mut detector, job, cancel, update)
+            });
+        })
+        .unwrap();
         queue.add(&source, settings()).unwrap();
         queue.add(&source, settings()).unwrap();
         queue

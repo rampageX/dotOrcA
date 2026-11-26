@@ -56,6 +56,7 @@ fn run_fixture(tool: &Path, args: &[&str], path: &Path) {
 #[test]
 #[ignore = "S06 CI supplies external FFmpeg and FFprobe"]
 fn production_special_path_vfr_audio_and_hdr() {
+    decision::allow_fixture_fallback();
     let root = test_root();
     let ffmpeg = tool("DOTORCA_TEST_FFMPEG");
     let ffprobe = tool("DOTORCA_TEST_FFPROBE");

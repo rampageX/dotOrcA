@@ -50,6 +50,7 @@ pub enum Error {
     Io(io::Error),
     Process(String),
     NoRoute,
+    HardwareRouteUnavailable,
     CapacityExceeded { limit: u64, measured: u64 },
 }
 
@@ -728,7 +729,17 @@ fn encode_inner(
         let route = match decision.selection {
             Selection::DefaultHardware(route) => route,
             Selection::ProactiveSoftware | Selection::SoftwareFallback(_) => Route::Software,
-            Selection::NoRoute => return Err(Error::NoRoute),
+            Selection::NoRoute => {
+                let software_available = decision.candidates.iter().any(|candidate| {
+                    candidate.route == Route::Software
+                        && candidate.capability != decision::Capability::Unavailable
+                });
+                return Err(if software_available {
+                    Error::HardwareRouteUnavailable
+                } else {
+                    Error::NoRoute
+                });
+            }
         };
         let result = (|| {
             run_encoder(
