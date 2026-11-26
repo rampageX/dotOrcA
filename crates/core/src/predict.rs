@@ -3,6 +3,8 @@ use serde_json::{Value,json};
 use std::{collections::HashSet,fs,io,path::Path};
 use crate::hardware::{Inventory,Capability,Evidence};
 
+mod nvenc;
+pub use nvenc::NvencQuery;
 pub const MODEL_VERSION:&str="reference-pipeline-v1";
 /// Same SHA256 route used by S02, not just the displayed FFmpeg version.
 pub fn tool_sha256(ffmpeg:&Path,tool:&Path,cancel:&std::sync::atomic::AtomicBool)->io::Result<String>{crate::benchmark::file_hash(ffmpeg,tool,cancel)}
@@ -78,7 +80,7 @@ fn parse(text:&str,origin:&str)->io::Result<Vec<Value>>{
     Ok(ds.clone())
 }
 #[derive(Debug)]
-pub struct Database{official:Vec<Value>,local:Vec<Value>,mapping:Value}
+pub struct Database{official:Vec<Value>,local:Vec<Value>,mapping:Value,nvenc:Value}
 #[derive(Debug,Clone)]
 pub struct Query<'a>{
     pub inventory:&'a Inventory,
@@ -109,7 +111,9 @@ impl Database{
         let official=parse(OFFICIAL,"official")?;
         let mapping:Value=serde_json::from_str(MAP).map_err(|e|bad(&e.to_string()))?;
         if mapping["schema_version"]!=1||mapping["version"]!="hardware-map-v1"||official.len()!=2||official.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>()!=264{return Err(bad("bundled database integrity"))}
-        Ok(Self{official,local:Vec::new(),mapping})
+        let nvenc:Value=serde_json::from_str(include_str!("../../../data/official/nvenc-sdk13.1-v1.json")).map_err(|e|bad(&e.to_string()))?;
+        if nvenc["schema_version"]!=1||nvenc["version"]!=nvenc::VERSION{return Err(bad("vendor reference schema"))}
+        Ok(Self{official,local:Vec::new(),mapping,nvenc})
     }
     /// Reads a separate, explicit local file. No write, merge, download or learning.
     pub fn with_local(mut self,path:&Path)->io::Result<Self>{
@@ -118,7 +122,7 @@ impl Database{
         self.local=local;Ok(self)
     }
     pub fn info(&self)->Value{
-        json!({"model_version":MODEL_VERSION,"official_datasets":self.official.len(),"local_datasets":self.local.len(),"official_samples":self.official.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>(),"local_samples":self.local.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>(),"mapping":self.mapping})
+        json!({"model_version":MODEL_VERSION,"official_datasets":self.official.len(),"local_datasets":self.local.len(),"official_samples":self.official.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>(),"local_samples":self.local.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>(),"mapping":self.mapping,"vendor_reference_version":self.nvenc["version"]})
     }
     pub fn hardware_mapping(&self,inv:&Inventory)->Value{
         json!({"cpu":inv.cpu.as_deref().and_then(|n|aliases(&self.mapping,"cpus",n)),"gpus":inv.adapters.iter().map(|a|json!({"name":a.name,"mapping":a.name.as_deref().and_then(|n|aliases(&self.mapping,"gpus",n))})).collect::<Vec<_>>()})
