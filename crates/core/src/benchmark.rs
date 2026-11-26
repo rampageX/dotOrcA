@@ -69,7 +69,7 @@ fn hash(r: &Request, cancel: &AtomicBool) -> io::Result<String> {
     if h.len()!=64 || !h.bytes().all(|c|c.is_ascii_hexdigit()) {return Err(invalid("invalid SHA256"));}
     Ok(h.to_ascii_lowercase())
 }
-fn file_hash(exe: &Path, p: &Path, cancel: &AtomicBool) -> io::Result<String> {
+pub(crate) fn file_hash(exe: &Path, p: &Path, cancel: &AtomicBool) -> io::Result<String> {
     hash(&ff(exe).args(["-v","error","-f","data","-i"]).args([p.as_os_str()]).args(["-map","0:0","-c","copy","-f","hash","-hash","sha256","-"]),cancel)
 }
 fn decoded_hash(exe: &Path, p: &Path, f: Fixture, cancel: &AtomicBool) -> io::Result<String> {
