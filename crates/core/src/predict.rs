@@ -166,6 +166,34 @@ impl Database{
         }
         unknown(if soft{"no_comparable_cpu_reference"}else{"no_comparable_gpu_pipeline_reference"})
     }
+    /// Leave an entire physical machine out, then predict its CPU-only rows
+    /// from the other machine. This is cross-validation, not new measurements.
+    pub fn cpu_holdout(&self)->Value{
+        let mut groups=Vec::new();
+        for held in &self.official{
+            let e=&held["environment"];
+            let inv=Inventory{cpu:e["cpu"].as_str().map(str::to_owned),logical_cpus:e["logical_cpus"].as_u64().map(|n|n as usize),adapters:Vec::new(),adapter_scan_complete:false,adapter_scan_error:None};
+            let model=Self{official:self.official.iter().filter(|d|d["source_report_sha256"]!=held["source_report_sha256"]).cloned().collect(),local:Vec::new(),mapping:self.mapping.clone(),nvenc:self.nvenc.clone()};
+            for encoder in ["libx264","libx265","libsvtav1"]{
+                let mut errors=Vec::new();let mut covered=0;let mut unknown=0;let mut slower=0;
+                for r in held["records"].as_array().into_iter().flatten().filter(|r|r["encoder"]==encoder){
+                    let Some(f)=held["fixtures"].as_array().and_then(|fs|fs.iter().find(|f|f["id"]==r["fixture_id"]))else{unknown+=1;continue};
+                    let q=Query{inventory:&inv,capabilities:&[],ffmpeg_sha256:e["ffmpeg_sha256"].as_str().unwrap_or(""),ffprobe_sha256:e["ffprobe_sha256"].as_str().unwrap_or(""),encoder,preset:r["preset"].as_str().unwrap_or(""),width:f["width"].as_u64().unwrap_or(0) as u32,height:f["height"].as_u64().unwrap_or(0) as u32,bit_depth:f["bit_depth"].as_u64().unwrap_or(0) as u8,target_bitrate_bps:f["target_bitrate_bps"].as_u64().unwrap_or(0),fixture_decoded_sha256:f["decoded_sha256"].as_str(),frames:180};
+                    let x=model.estimate(&q);
+                    let (Some(p),Some(actual),Some(lo),Some(hi))=(x["pipeline_fps"].as_f64(),r["fps"].as_f64(),x["heuristic_fps_range"][0].as_f64(),x["heuristic_fps_range"][1].as_f64())else{unknown+=1;continue};
+                    if x["kind"]!="inferred_cpu_reference"{unknown+=1;continue}
+                    errors.push((p/actual-1.0).abs()*100.0);
+                    if actual>=lo&&actual<=hi{covered+=1}
+                    if actual<lo{slower+=1}
+                }
+                errors.sort_by(f64::total_cmp);
+                let n=errors.len();
+                let percentile=|p:f64|if n==0{None}else{Some(errors[((p*n as f64).ceil() as usize).saturating_sub(1).min(n-1)])};
+                groups.push(json!({"held_machine":held["machine"],"held_report":held["source_report_sha256"],"encoder":encoder,"predicted":n,"unknown":unknown,"median_absolute_error_pct":percentile(0.5),"p90_absolute_error_pct":percentile(0.9),"heuristic_range_covered":covered,"slower_than_heuristic_lower_fps":slower}));
+            }
+        }
+        json!({"kind":"leave_one_machine_out_cross_validation","independent_new_measurements":false,"confidence_calibrated":false,"groups":groups})
+    }
     pub fn reference_cases(&self)->impl Iterator<Item=(&Value,&Value,&Value)>{
         self.official.iter().flat_map(|d|d["records"].as_array().into_iter().flatten().filter_map(move |r|d["fixtures"].as_array()?.iter().find(|f|f["id"]==r["fixture_id"]).map(|f|(d,f,r))))
     }
@@ -204,6 +232,15 @@ mod tests{
         let q=Query{inventory:&g,capabilities:&cap,ffmpeg_sha256:e["ffmpeg_sha256"].as_str().unwrap(),ffprobe_sha256:e["ffprobe_sha256"].as_str().unwrap(),encoder:"hevc_nvenc",preset:r["preset"].as_str().unwrap(),width:f["width"].as_u64().unwrap() as u32,height:f["height"].as_u64().unwrap() as u32,bit_depth:cap[0].bit_depth,target_bitrate_bps:f["target_bitrate_bps"].as_u64().unwrap(),fixture_decoded_sha256:f["decoded_sha256"].as_str(),frames:180};
         assert_eq!(db.estimate(&q)["kind"],"unknown");
         assert_eq!(db.hardware_mapping(&g)["gpus"][0]["mapping"]["nvenc_engines"],2);
+    }
+    #[test]fn held_machine_is_not_training_data(){
+        let db=Database::bundled().unwrap();
+        let report=db.cpu_holdout();
+        let groups=report["groups"].as_array().unwrap();
+        assert_eq!(groups.len(),6);
+        assert_eq!(groups.iter().map(|g|g["predicted"].as_u64().unwrap()).sum::<u64>(),144);
+        assert!(groups.iter().all(|g|g["unknown"]==0&&g["p90_absolute_error_pct"].is_number()));
+        assert_eq!(report["confidence_calibrated"],false);
     }
     #[test]fn rejects_invalid_data(){
         assert!(parse(OFFICIAL,"local").is_err());
