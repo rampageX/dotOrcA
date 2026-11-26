@@ -12,11 +12,13 @@ fn run()->io::Result<()>{
     let mut ffprobe=root.join("tools").join(format!("ffprobe{suffix}"));
     let mut local=None;
     let mut mode=None;
+    let mut input=None;
     let mut args=std::env::args_os().skip(1);
     while let Some(a)=args.next(){
         match a.to_str(){
-            Some("--help"|"-h")=>{println!("orca-predict --info | --holdout | --probe [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --holdout: CPU cross-validation; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
+            Some("--help"|"-h")=>{println!("orca-predict --info | --holdout | --probe | --validate PATH [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --holdout: CPU cross-validation; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
             Some("--info"|"--holdout"|"--probe") if mode.is_none()=>mode=a.into_string().ok(),
+            Some("--validate") if mode.is_none()=>{mode=Some("--validate".into());input=Some(PathBuf::from(args.next().ok_or_else(||io::Error::other("missing source path"))?));},
             Some("--ffmpeg")=>ffmpeg=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffmpeg path"))?),
             Some("--ffprobe")=>ffprobe=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffprobe path"))?),
             Some("--local") if local.is_none()=>local=Some(PathBuf::from(args.next().ok_or_else(||io::Error::other("missing local dataset path"))?)),
@@ -27,12 +29,19 @@ fn run()->io::Result<()>{
     if let Some(p)=local{db=db.with_local(&p)?;}
     if mode.as_deref()==Some("--info"){println!("{}",serde_json::to_string_pretty(&db.info()).map_err(io::Error::other)?);return Ok(())}
     if mode.as_deref()==Some("--holdout"){println!("{}",serde_json::to_string_pretty(&db.cpu_holdout()).map_err(io::Error::other)?);return Ok(())}
-    if mode.as_deref()!=Some("--probe"){return Err(io::Error::other("select --info, --holdout or --probe"))}
+    if !matches!(mode.as_deref(),Some("--probe"|"--validate")){return Err(io::Error::other("select --info, --holdout, --probe or --validate"))}
     let ffmpeg=std::fs::canonicalize(ffmpeg)?;let ffprobe=std::fs::canonicalize(ffprobe)?;
     let cancel=AtomicBool::new(false);
     let report=hardware::Detector::default().detect(&ffmpeg,&cancel)?;
     let ffhash=tool_sha256(&ffmpeg,&ffmpeg,&cancel)?;
     let fphash=tool_sha256(&ffmpeg,&ffprobe,&cancel)?;
+    if let Some(input)=input{
+        let mut v=orca_core::predict::sample::validate(&ffmpeg,&ffprobe,&input,&report,&cancel)?;
+        v["ffmpeg_sha256"]=json!(ffhash);v["ffprobe_sha256"]=json!(fphash);
+        v["cpu"]=json!(report.inventory.cpu);v["hardware"]=db.hardware_mapping(&report.inventory);
+        v["adapters"]=json!(report.inventory.adapters.iter().map(|a|json!({"name":a.name,"driver_version":a.driver_version})).collect::<Vec<_>>());
+        println!("{}",serde_json::to_string_pretty(&v).map_err(io::Error::other)?);return Ok(())
+    }
     let mut seen=BTreeSet::new();let mut results:Vec<Value>=Vec::new();
     let mut measured=0;let mut inferred=0;let mut unknown=0;
     for (_,f,r) in db.reference_cases(){
