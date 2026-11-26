@@ -38,4 +38,4 @@ S00 基线验收通过（2026-11-26）。S01 核心 CI 与 Ryzen 5800H/T600、i5
   - [ ] 独立验证真实视频生产 ETA 误差及 GPU 编码性能校准（覆盖时长、分辨率、编码格式、SDR/HDR、硬件与负载；不重复 S02 旧矩阵）。
   - [ ] 真实 UNC 共享访问。Intel QSV、AMF 10-bit 与逐适配器归属按可用设备实测，允许后续补充。
   - [ ] 无开发工具/额外 VC++ 运行库的干净 Windows 主机便携启动；量化冷/热启动和空闲资源。
-- [ ] S10：正式发行 v1.0.0（用户授权；由 main 完整 CI 成功后发布，实际状态以 Release 为准）。
+- [x] S10：正式发行 [v1.0.0](https://github.com/rampageX/dotOrcA/releases/tag/v1.0.0)，用户确认已下载；随后授权 MIT License。

@@ -17,6 +17,6 @@ Windows x64 全自动视频压缩器，Rust + CUI v1.5.0。指定每个文件的
 
 ## 开发
 
-纯 Rust：cargo test --locked、cargo check --locked。GUI 需要 Windows MSVC、CMake 与固定 Rust 工具链；这些不是运行时依赖。常规 CI 单入口，手动运行执行全套回归。第三方许可见发行包 licenses/；项目自身源码许可尚未指定。
+纯 Rust：cargo test --locked、cargo check --locked。GUI 需要 Windows MSVC、CMake 与固定 Rust 工具链；这些不是运行时依赖。常规 CI 单入口，手动运行执行全套回归。项目自有代码采用 [MIT License](LICENSE)，Copyright (c) 2026 rampageX。第三方代码、资源（包括 Twemoji 虎鲸图标）及外置 FFmpeg 保留各自的许可；发行包第三方许可见 licenses/。
 
 [项目章程](docs/CHARTER.md) · [总任务卡](docs/ROADMAP.md) · [架构](docs/ARCHITECTURE.md) · [工程规范](AGENTS.md) · [发行说明](docs/RELEASE-NOTES.md)
