@@ -1,0 +1,66 @@
+name: S00 validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pure-go:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - run: go build ./...
+  gui-probe:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
+          update: false
+      - name: Bootstrap locked dependencies and build probe
+        shell: pwsh
+        working-directory: gui
+        env:
+          CGO_ENABLED: '1'
+          CC: 'gcc'
+        run: |
+          $gcc = Join-Path '${{ steps.msys2.outputs.msys2-location }}' 'ucrt64\bin'
+          if (-not (Test-Path (Join-Path $gcc 'gcc.exe'))) { throw 'UCRT64 GCC not found' }
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          $env:PATH = "$gcc;$env:PATH"
+          gcc --version
+          go version
+          if (-not (Test-Path go.sum)) { go mod tidy; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          go mod verify
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go build -mod=readonly -trimpath -ldflags '-H=windowsgui -s -w -extldflags=-static' -o ../dist/dotOrcA-S00.exe .
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          objdump -p ../dist/dotOrcA-S00.exe | Out-File -Encoding utf8 ../dist/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go version -m ../dist/dotOrcA-S00.exe | Out-File -Encoding utf8 ../dist/build-info.txt
+          Get-FileHash ../dist/dotOrcA-S00.exe -Algorithm SHA256 | Format-List | Out-File -Encoding utf8 ../dist/sha256.txt
+          Copy-Item go.mod,go.sum ../dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotOrcA-S00-probe
+          path: dist/
+          if-no-files-found: error

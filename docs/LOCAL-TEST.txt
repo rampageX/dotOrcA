@@ -1,0 +1,13 @@
+LOCAL ENVIRONMENT: Linux amd64, Go 1.23.2; no networked Fyne dependencies, no MinGW
+go version go1.23.2 linux/amd64
+CGO_ENABLED=0 go vet ./...
+PASS
+CGO_ENABLED=0 go test -count=1 ./...
+?   github.com/rampageX/dotOrcA/cmd/benchmark [no test files]
+ok  github.com/rampageX/dotOrcA/internal/contract 0.002s
+PASS
+CGO_ENABLED=0 go build ./...
+PASS
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build benchmark
+/tmp/dotOrcA-benchmark-S00.exe: PE32+ executable for MS Windows 6.01 (console), x86-64, 15 sections
+PASS

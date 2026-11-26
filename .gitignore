@@ -1,0 +1,6 @@
+/dist/
+*.exe
+/config/
+/data/local/
+/logs/
+/work/
