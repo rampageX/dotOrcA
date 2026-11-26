@@ -29,7 +29,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-            choco install ffmpeg -y --no-progress
+            choco install ffmpeg --version=9.1.0 -y --no-progress
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             $env:PATH += ";C:\ProgramData\chocolatey\bin"
           }

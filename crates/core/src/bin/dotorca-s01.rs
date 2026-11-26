@@ -122,7 +122,7 @@ fn media_fixtures(ffmpeg:&Path,ffprobe:&Path)->io::Result<()>{
     println!("PASS real long Unicode path");
     for (transfer,expected) in [("smpte2084",media::Hdr::Pq),("arib-std-b67",media::Hdr::Hlg),("bt709",media::Hdr::Sdr)]{
         let path=root.join(format!("{transfer}.mkv"));
-        let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i","testsrc2=s=128x96:r=25,format=yuv420p10le","-frames:v","3","-c:v","ffv1","-pix_fmt","yuv420p10le","-color_trc",transfer,"-color_primaries","bt2020","-colorspace","bt2020nc","-color_range","tv","-y"].into_iter().map(Into::into).collect();
+        let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i","testsrc2=s=128x96:r=25,format=yuv420p10le","-frames:v","3","-c:v","libx265","-preset","ultrafast","-x265-params","log-level=error:pools=1:frame-threads=1","-pix_fmt","yuv420p10le","-color_trc",transfer,"-color_primaries","bt2020","-colorspace","bt2020nc","-color_range","tv","-y"].into_iter().map(Into::into).collect();
         args.push(path.as_os_str().into());run_ffmpeg(args)?;
         let m=media::probe(ffprobe,&path,&cancel)?;
         let v=&m.streams[0];
