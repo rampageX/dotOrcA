@@ -7,7 +7,7 @@ fn arg_error(s:&str)->io::Error{io::Error::new(io::ErrorKind::InvalidInput,s)}
 fn report_self_test()->io::Result<()> {
     let me=std::env::current_exe()?;
     let cancel=Arc::new(AtomicBool::new(false));
-    let args=["小K 的鹅腿坟场 & (黑洞) ^ % !.avi","emoji-🫍-𠮷.avi","-leading.avi",r#"quote"inside"#,r#"trailing\","#,r#"C:\a b\\"#,r#"\\server\share\中文 & (x).avi"#,r#"\\?\C:\long path\中文.avi"#];
+    let args=["小K 的鹅腿坟场 & (黑洞) ^ % !.avi","emoji-🫍-𠮷.avi","-leading.avi",r#"quote"inside"#,r#"trailing\"#,r#"C:\a b\\"#,r#"\\server\share\中文 & (x).avi"#,r#"\\?\C:\long path\中文.avi"#];
     let o=process::run(&Request::new(&me).args(["--child-argv"]).args(args),&cancel)?;
     let expected=serde_json::to_vec(&args).map_err(io::Error::other)?;
     if !o.status.success()||o.stdout.bytes!=expected {return Err(io::Error::other(format!("argv mismatch: {:?}",o)));}
@@ -94,6 +94,49 @@ fn child_mode(args:&[OsString])->io::Result<bool>{
     }
     Ok(true)
 }
+
+fn media_fixtures(ffmpeg:&Path,ffprobe:&Path)->io::Result<()>{
+    let scratch=Scratch::new()?;
+    let root=scratch.0.clone();
+    let cancel=AtomicBool::new(false);
+    let run_ffmpeg=|args:Vec<OsString>|->io::Result<()>{
+        let o=process::run(&Request::new(ffmpeg).args(args),&cancel)?;
+        if o.stop!=Stop::Exited||!o.status.success(){return Err(io::Error::other(format!("fixture: {:?}",o)));}
+        Ok(())
+    };
+    let avi=root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+    let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i","testsrc2=s=128x96:r=30000/1001","-f","lavfi","-i","sine=frequency=1000:sample_rate=48000","-t","0.4","-c:v","mpeg4","-c:a","pcm_s16le","-y"].into_iter().map(Into::into).collect();
+    args.push(avi.as_os_str().into());
+    run_ffmpeg(args)?;
+    let m=media::probe(ffprobe,&avi,&cancel)?;
+    let v=m.streams.iter().find(|s|s.kind.as_deref()==Some("video")).ok_or_else(||io::Error::other("missing video"))?;
+    if m.size_bytes!=Some(std::fs::metadata(&avi)?.len())||m.duration_us.is_none()||v.width!=Some(128)||v.height!=Some(96)||v.avg_rate!=Some(media::Rational{numerator:30000,denominator:1001})||v.bit_depth!=Some(8)||!m.streams.iter().any(|s|s.kind.as_deref()==Some("audio")&&s.sample_rate==Some(48000)){
+        return Err(io::Error::other(format!("AVI fixture mismatch: {:?}",m)));
+    }
+    println!("PASS real AVI special filename, rational rate, actual bytes, audio");
+    let long=root.join("长路径-𠮷-🫍-".repeat(8)).join("segment-".repeat(20)).join("another-".repeat(12));
+    std::fs::create_dir_all(&long)?;
+    let copy=long.join("-long & (path) ^ % !.avi");std::fs::copy(&avi,&copy)?;
+    let m2=media::probe(ffprobe,&copy,&cancel)?;
+    if m2.size_bytes!=m.size_bytes||m2.duration_us!=m.duration_us{return Err(io::Error::other("long path fixture mismatch"));}
+    println!("PASS real long Unicode path");
+    for (transfer,expected) in [("smpte2084",media::Hdr::Pq),("arib-std-b67",media::Hdr::Hlg),("bt709",media::Hdr::Sdr)]{
+        let path=root.join(format!("{transfer}.mkv"));
+        let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i","testsrc2=s=128x96:r=25,format=yuv420p10le","-frames:v","3","-c:v","ffv1","-pix_fmt","yuv420p10le","-color_trc",transfer,"-color_primaries","bt2020","-colorspace","bt2020nc","-color_range","tv","-y"].into_iter().map(Into::into).collect();
+        args.push(path.as_os_str().into());run_ffmpeg(args)?;
+        let m=media::probe(ffprobe,&path,&cancel)?;
+        let v=&m.streams[0];
+        if v.hdr!=expected||v.bit_depth!=Some(10)||v.color_transfer.as_deref()!=Some(transfer)||v.color_range.as_deref()!=Some("tv"){return Err(io::Error::other(format!("color fixture mismatch: {:?}",v)));}
+        println!("PASS real {transfer} 10-bit color tags");
+    }
+    let invalid=root.join("invalid.avi");std::fs::write(&invalid,b"not a media file")?;
+    if media::probe(ffprobe,&invalid,&cancel).is_ok(){return Err(io::Error::other("invalid media accepted"));}
+    drop(scratch);
+    if root.exists(){return Err(io::Error::other("owned scratch cleanup failed"));}
+    println!("PASS invalid media and owned scratch cleanup");
+    Ok(())
+}
+
 fn run()->io::Result<()> {
     let args:Vec<OsString>=std::env::args_os().skip(1).collect();
     if child_mode(&args)?{return Ok(());}
@@ -102,7 +145,7 @@ fn run()->io::Result<()> {
     let suffix=std::env::consts::EXE_SUFFIX;
     let mut ffmpeg=root.join("tools").join(format!("ffmpeg{suffix}"));
     let mut ffprobe=root.join("tools").join(format!("ffprobe{suffix}"));
-    let mut media_paths=Vec::new();let mut detect=true;
+    let mut media_paths=Vec::new();let mut detect=true;let mut fixtures=false;
     let mut i=0;
     while i<args.len(){
         match args[i].to_str(){
@@ -111,18 +154,20 @@ fn run()->io::Result<()> {
                 match args[i].to_str().unwrap(){"--ffmpeg"=>ffmpeg=absolute(v.into())?,"--ffprobe"=>ffprobe=absolute(v.into())?,_=>media_paths.push(PathBuf::from(v))}
                 i+=2;
             }
+            Some("--ci-media")=>{fixtures=true;i+=1;}
             Some("--no-hardware")=>{detect=false;i+=1;}
             Some("--help")=>{println!("dotorca-s01 [--self-test] [--ffmpeg PATH] [--ffprobe PATH] [--no-hardware] [--media FILE ...]\nDefault tools directory is next to EXE. No source files are modified.");return Ok(());}
             _=>{media_paths.push(PathBuf::from(&args[i]));i+=1;}
         }
     }
+    if fixtures {return media_fixtures(&ffmpeg,&ffprobe);}
     let cancel=AtomicBool::new(false);
     for path in media_paths {
         let info=media::probe(&ffprobe,&path,&cancel)?;
         println!("MEDIA: {}\nsize_bytes={:?} duration_us={:?} format={:?}",info.path.display(),info.size_bytes,info.duration_us,info.format);
         for s in &info.streams {
-            println!("STREAM {:?} {:?} {:?}: {}x{} fps={:?} nominal={:?} depth={:?} hdr={:?} pix_fmt={:?} range={:?} space={:?} transfer={:?} primaries={:?} channels={:?} sample_rate={:?} attached_pic={}",
-                s.index,s.kind,s.codec,s.width.unwrap_or(0),s.height.unwrap_or(0),s.avg_rate,s.nominal_rate,s.bit_depth,s.hdr,s.pixel_format,s.color_range,s.color_space,s.color_transfer,s.color_primaries,s.channels,s.sample_rate,s.attached_picture);
+            println!("STREAM {:?} {:?} {:?}: {:?}x{:?} fps={:?} nominal={:?} depth={:?} hdr={:?} pix_fmt={:?} range={:?} space={:?} transfer={:?} primaries={:?} channels={:?} sample_rate={:?} attached_pic={}",
+                s.index,s.kind,s.codec,s.width,s.height,s.avg_rate,s.nominal_rate,s.bit_depth,s.hdr,s.pixel_format,s.color_range,s.color_space,s.color_transfer,s.color_primaries,s.channels,s.sample_rate,s.attached_picture);
             if let Some(side)=s.raw.get("side_data_list"){println!("SIDE DATA: {side}");}
         }
     }
