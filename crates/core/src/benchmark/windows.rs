@@ -14,6 +14,7 @@ struct Guid { a:u32,b:u16,c:u16,d:[u8;8] }
 extern "system" { fn RtlGetVersion(v:*mut Version)->i32; }
 #[link(name="kernel32")]
 extern "system" {
+    fn GetSystemTimes(idle:*mut FileTime,kernel:*mut FileTime,user:*mut FileTime)->i32;
     fn GlobalMemoryStatusEx(v:*mut Memory)->i32;
     fn GetSystemPowerStatus(v:*mut Power)->i32;
     fn LocalFree(p:*mut c_void)->*mut c_void;
@@ -38,4 +39,21 @@ pub(super) fn snapshot()->Value {
         if !g.is_null(){let _=LocalFree(g.cast());}
         json!({"version":version,"memory":memory,"power":power,"power_scheme_guid":scheme})
     }
+}
+
+#[repr(C)]
+#[derive(Clone,Copy,Default)]
+struct FileTime{low:u32,high:u32}
+impl FileTime{fn ticks(self)->u64{(u64::from(self.high)<<32)|u64::from(self.low)}}
+fn cpu_times()->Option<(u64,u64,u64)>{
+    let(mut a,mut b,mut c)=(FileTime::default(),FileTime::default(),FileTime::default());
+    // SAFETY: three distinct initialized writable FILETIME buffers.
+    if unsafe{GetSystemTimes(&mut a,&mut b,&mut c)}==0{return None}
+    Some((a.ticks(),b.ticks(),c.ticks()))
+}
+pub(super) fn pretest_cpu_busy()->Option<f64>{
+    let a=cpu_times()?;std::thread::sleep(std::time::Duration::from_millis(250));let b=cpu_times()?;
+    let idle=b.0.checked_sub(a.0)?;let total=b.1.checked_sub(a.1)?.checked_add(b.2.checked_sub(a.2)?)?;
+    if total==0||idle>total{return None}
+    Some(100.0*(total-idle) as f64/total as f64)
 }
