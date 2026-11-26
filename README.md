@@ -1,13 +1,22 @@
-# dotOrcA 🐋
+# dotOrcA 🫍
 
-全自动视频压缩器。以目标文件容量为硬约束，在画质与处理时间之间智能决策。
+Windows x64 全自动视频压缩器，Rust + CUI v1.5.0。指定每个文件的容量上限，自动计算码率并默认使用硬件编码。
 
-技术栈：Rust + CUI v1.5.0（CPU 软件渲染），Windows x64，便携式单 EXE，外置编码器和数据。核心与 Benchmark 保持纯 Rust；CUI 通过薄 C ABI 桥接。S08 候选实现已接入生产编码与批量队列，验收状态见 [S08.md](docs/S08.md)。
+## 使用方法
 
-- [项目章程](docs/CHARTER.md)
-- [总任务卡](docs/ROADMAP.md)
-- [架构](docs/ARCHITECTURE.md)
-- [技术选型与验收记录](docs/S00.md)
-- [工程规范](AGENTS.md)
+1. 从 GitHub Releases 下载 Windows x64 ZIP，解压到可写目录。
+2. 在 dotorca.exe 同级的 tools/ 目录放入兼容的 FFmpeg 和 FFprobe（ffmpeg.exe、ffprobe.exe；需支持本机硬件编码器）。发行包不包含 FFmpeg。
+3. 拖入视频，设置固定 MiB 或原文件百分比、H.264/HEVC/AV1、最大边，点击 Start queued。
+4. 成品保存在 output/，日志位于 logs/。Reset 后可修改参数再次编码，已有成品不会被覆盖。
 
-纯 Rust：在根目录执行 `cargo test --locked`、`cargo check --locked`。GUI 仅在 Windows MSVC 构建；CMake 先构建 CUI 静态库，Cargo 再链接，具体命令见 CI。构建需要 Rust/CMake/MSVC，不是用户运行时依赖。许可证待定，暂不发布正式版。
+源文件已在容量上限以内则跳过；源尺寸未超过最大边则保留原分辨率。PQ/HLG 保留位深与色彩，隔行源逐场反交错。已知双 NVENC 型号最多并行两任务。硬编失败直接报告，不自动切换软编。输出按参数命名，例如 Movie_50%_HEVC_1920.MP4，同名直接跳过。
+
+## 已知边界
+
+生产 ETA 暂未独立校准；未知值不伪造。QSV/AMF、真实 UNC 和无开发工具的干净 Windows 环境仍待专项验证。兼容性以实际 FFmpeg 和 GPU 能力为准；已识别的动态 HDR 不支持时明确失败。
+
+## 开发
+
+纯 Rust：cargo test --locked、cargo check --locked。GUI 需要 Windows MSVC、CMake 与固定 Rust 工具链；这些不是运行时依赖。常规 CI 单入口，手动运行执行全套回归。第三方许可见发行包 licenses/；项目自身源码许可尚未指定。
+
+[项目章程](docs/CHARTER.md) · [总任务卡](docs/ROADMAP.md) · [架构](docs/ARCHITECTURE.md) · [工程规范](AGENTS.md) · [发行说明](docs/RELEASE-NOTES.md)
