@@ -57,9 +57,9 @@ fn parse(text:&str,origin:&str)->io::Result<Vec<Value>>{
                 "libx264"=>("h264",&["fast","medium"]),
                 "libx265"=>("hevc",&["fast","medium"]),
                 "libsvtav1"=>("av1",&["6","8"]),
-                "h264_nvenc"=>("h264",&["p4","p7"]),
-                "hevc_nvenc"=>("hevc",&["p4","p7"]),
-                "av1_nvenc"=>("av1",&["p4","p7"]),
+                "h264_nvenc"=>("h264",&["p4","p6"]),
+                "hevc_nvenc"=>("hevc",&["p4","p6"]),
+                "av1_nvenc"=>("av1",&["p4","p6"]),
                 "h264_qsv"=>("h264",&["fast","slow"]),
                 "hevc_qsv"=>("hevc",&["fast","slow"]),
                 "av1_qsv"=>("av1",&["fast","slow"]),
@@ -172,7 +172,7 @@ mod tests{
         let db=Database::bundled().unwrap();assert_eq!(db.info()["official_samples"],264);
         let mut n=0;
         for(d,f,r)in db.reference_cases(){
-            let e=&d["environment"];let mut hw=inv(e);
+            let e=&d["environment"];let hw=inv(e);
             let cap=[Capability{encoder:r["encoder"].as_str().unwrap().into(),bit_depth:r["bit_depth"].as_u64().unwrap() as u8,evidence:Evidence::Verified,diagnostic:String::new()}];
             let mut q=Query{inventory:&hw,capabilities:&cap,ffmpeg_sha256:e["ffmpeg_sha256"].as_str().unwrap(),ffprobe_sha256:e["ffprobe_sha256"].as_str().unwrap(),encoder:&cap[0].encoder,preset:r["preset"].as_str().unwrap(),width:f["width"].as_u64().unwrap() as u32,height:f["height"].as_u64().unwrap() as u32,bit_depth:cap[0].bit_depth,target_bitrate_bps:f["target_bitrate_bps"].as_u64().unwrap(),fixture_decoded_sha256:f["decoded_sha256"].as_str(),frames:180};
             let x=db.estimate(&q);assert_eq!(x["kind"],"measured_reference");assert!(near(x["pipeline_fps"].as_f64().unwrap(),r["fps"].as_f64().unwrap()));assert!(x["isolated_encoder_fps"].is_null());assert!(x["production_seconds"].is_null());
