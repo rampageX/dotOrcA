@@ -4,6 +4,7 @@ use std::{collections::HashSet,fs,io,path::Path};
 use crate::hardware::{Inventory,Capability,Evidence};
 
 mod nvenc;
+pub mod sample;
 pub use nvenc::NvencQuery;
 pub const MODEL_VERSION:&str="reference-pipeline-v1";
 /// Same SHA256 route used by S02, not just the displayed FFmpeg version.
