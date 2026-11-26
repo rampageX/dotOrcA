@@ -1,4 +1,5 @@
-//! Pure Rust application engine boundary.
-//! S00 defines the architecture only. Media probing, process management,
-//! encoding, prediction and scheduling are deliberately not implemented.
-#![forbid(unsafe_code)]
+//! Pure Rust application engine. Platform FFI is isolated in process/platform and hardware/windows.
+#![deny(unsafe_code)]
+pub mod media;
+pub mod process;
+pub mod hardware;
