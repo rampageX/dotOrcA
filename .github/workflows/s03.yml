@@ -28,6 +28,7 @@ jobs:
           [IO.File]::WriteAllText($bad,'[{"schema_version":999}]')
           & $exe --info --local $bad
           if ($LASTEXITCODE -eq 0) { throw 'Invalid local dataset accepted' }
+          $global:LASTEXITCODE = 0
           Remove-Item -LiteralPath $bad
           New-Item -ItemType Directory -Force dist-s03 | Out-Null
           $info | ConvertTo-Json -Depth 20 | Out-File dist-s03/info.json
