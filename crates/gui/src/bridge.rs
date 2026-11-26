@@ -140,6 +140,10 @@ pub extern "C" fn orca_action(action: u32, id: u32) -> i32 {
             1 => queue.cancel(id),
             2 => queue.clear_finished(),
             3 => queue.clear_all(),
+            4 => if let Err(error) = queue.reset(id) {
+                app.notice = error.into();
+                return 0;
+            },
             _ => return 0,
         }
         1
@@ -223,7 +227,7 @@ fn diagnostic_preview(error: &str) -> String {
 #[repr(C)]
 pub struct Row {
     id: u32,
-    // Bit 0: can cancel.
+    // Bit 0: can cancel; bit 1: terminal row (can reset).
     flags: u32,
     percent: i32,
     name: [c_char; 1024],
@@ -241,7 +245,7 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
         };
         let mut row = Row {
             id: job.id,
-            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling),
+            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling) | (u32::from(job.phase.finished()) << 1),
             percent: job.progress_percent.map_or(-1, i32::from),
             name: [0; 1024],
             status: [0; 512],
@@ -424,6 +428,19 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
+            let mut reset_row = std::mem::MaybeUninit::<Row>::uninit();
+            assert_eq!(orca_row(0, reset_row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
+            let reset_row = reset_row.assume_init();
+            assert_eq!(reset_row.flags, 2);
+            assert_eq!(orca_action(4, reset_row.id), 1);
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
+            assert_eq!(count, 1);
+            let mut fresh_row = std::mem::MaybeUninit::<Row>::uninit();
+            assert_eq!(orca_row(0, fresh_row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
+            let fresh_row = fresh_row.assume_init();
+            assert_eq!(fresh_row.flags, 1);
+            assert_ne!(fresh_row.id, reset_row.id);
+            assert_eq!(orca_action(4, fresh_row.id), 0);
             assert_eq!(orca_action(3, 0), 1);
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 0);

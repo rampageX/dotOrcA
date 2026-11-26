@@ -123,6 +123,38 @@ pub struct Job {
     pub output_info: Option<String>,
     pub failure: Option<String>,
     pub destination: Option<PathBuf>,
+    pub reset_attempt: bool,
+}
+
+impl Job {
+    fn waiting(id: u32, source: &Path, reset_attempt: bool) -> Self {
+        Self {
+            id,
+            source: source.into(),
+            source_bytes: None,
+            source_size_pending: true,
+            settings: None,
+            target_bytes: None,
+            phase: Phase::Waiting,
+            encoder: None,
+            progress_percent: None,
+            estimated_bytes: None,
+            eta: None,
+            output: None,
+            bytes: None,
+            elapsed: None,
+            selection: None,
+            detail: Vec::new(),
+            encoder_error: None,
+            retries: 0,
+            source_info: None,
+            target_info: None,
+            output_info: None,
+            failure: None,
+            destination: None,
+            reset_attempt,
+        }
+    }
 }
 
 struct Entry {
@@ -232,31 +264,7 @@ impl Queue {
             .ok_or("Queue ID range exhausted.")?;
         let id = state.next;
         state.entries.push(Entry {
-            view: Arc::new(Job {
-                id,
-                source: source.into(),
-                source_bytes: None,
-                source_size_pending: true,
-                settings: None,
-                target_bytes: None,
-                phase: Phase::Waiting,
-                encoder: None,
-                progress_percent: None,
-                estimated_bytes: None,
-                eta: None,
-                output: None,
-                bytes: None,
-                elapsed: None,
-                selection: None,
-                detail: Vec::new(),
-                encoder_error: None,
-                retries: 0,
-                source_info: None,
-                target_info: None,
-                output_info: None,
-                failure: None,
-                destination: None,
-            }),
+            view: Arc::new(Job::waiting(id, source, false)),
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.shared.size_ready.notify_one();
@@ -306,6 +314,26 @@ impl Queue {
         }
     }
 
+    /// Reset only a terminal row. A fresh ID and cancel token prevent a
+    /// delayed update from the previous attempt from contaminating the new one.
+    pub fn reset(&self, id: u32) -> Result<(), &'static str> {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closing || state.clearing {
+            return Err("Queue unavailable during shutdown or Clear All.");
+        }
+        let index = state.entries.iter().position(|e| e.view.id == id && e.view.phase.finished())
+            .ok_or("Only finished tasks can be reset.")?;
+        let next = state.next.checked_add(1).ok_or("Queue ID range exhausted.")?;
+        let source = state.entries[index].view.source.clone();
+        state.next = next;
+        state.entries[index] = Entry {
+            view: Arc::new(Job::waiting(next, &source, true)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        self.shared.size_ready.notify_one();
+        Ok(())
+    }
+
     pub fn clear_finished(&self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.clearing {
@@ -320,7 +348,7 @@ impl Queue {
         for entry in &mut state.entries {
             cancel_entry(entry);
         }
-        if state.entries.iter().all(|entry| entry.view.phase.finished()) {
+        if state.active.is_empty() && state.entries.iter().all(|entry| entry.view.phase.finished()) {
             state.entries.clear();
             state.clearing = false;
         } else {
@@ -594,6 +622,30 @@ fn media_summary(info: &crate::media::MediaInfo) -> String {
     lines.join("\n")
 }
 
+// A reset is an explicit request for another attempt. Preserve every old
+// output; only reset attempts may select a new suffix on a name conflict.
+// Publication itself still checks atomically that the destination is absent.
+fn output_path(dir: &Path, source: &Path, reset_attempt: bool) -> io::Result<PathBuf> {
+    let stem = source.file_stem().expect("checked on admission");
+    let mut name = stem.to_os_string();
+    name.push(".mp4");
+    let base = dir.join(name);
+    if !reset_attempt { return Ok(base); }
+    for number in 1..=10_000 {
+        let candidate = if number == 1 { base.clone() } else {
+            let mut name = stem.to_os_string();
+            name.push(format!(" ({number}).mp4"));
+            dir.join(name)
+        };
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "No free numbered output filename."))
+}
+
 fn encode(
     root: &Path,
     detector: &mut Detector,
@@ -640,13 +692,7 @@ fn encode(
                 ),
             ))
         })?;
-        let mut name = job
-            .source
-            .file_stem()
-            .expect("checked on admission")
-            .to_os_string();
-        name.push(".mp4");
-        let destination = dir.join(name);
+        let destination = output_path(&dir, &job.source, job.reset_attempt).map_err(pipeline::Error::Io)?;
         update.modify(|job| job.destination = Some(destination.clone()));
         // The pipeline's existing no-overwrite checks remain authoritative.
         // Let the source/plan metadata reach Details before a name conflict.
@@ -847,6 +893,60 @@ mod tests {
         }
         assert!(queue.snapshot().is_empty());
         queue.shutdown();
+    }
+
+    #[test]
+    fn reset_requeues_terminal_jobs_with_fresh_identity_and_settings() {
+        let queue = Queue::spawn(|shared| work(shared, |_, _, _| unreachable!())).unwrap();
+        let source = std::env::temp_dir().join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        for phase in [Phase::Published, Phase::Failed, Phase::Cancelled, Phase::Skipped] {
+            let id = queue.add(&source).unwrap();
+            assert!(queue.reset(id).is_err());
+            let update = Updates { shared: &queue.shared, id };
+            update.modify(|job| {
+                job.phase = phase;
+                job.settings = Some(settings());
+                job.target_bytes = Some(100);
+                job.progress_percent = Some(100);
+                job.output = Some(source.clone());
+                job.bytes = Some(50);
+                job.retries = 2;
+                job.failure = Some("old failure".into());
+                job.encoder_error = Some("old stderr".into());
+                job.detail.push("old detail".into());
+            });
+            queue.reset(id).unwrap();
+            let jobs = queue.snapshot();
+            let job = &jobs[0];
+            assert_ne!(job.id,id);
+            assert_eq!(job.source,source);
+            assert_eq!(job.phase,Phase::Waiting);
+            assert!(job.reset_attempt && job.settings.is_none() && job.target_bytes.is_none());
+            assert!(job.progress_percent.is_none() && job.output.is_none() && job.bytes.is_none());
+            assert!(job.failure.is_none() && job.encoder_error.is_none() && job.detail.is_empty());
+            assert_eq!(job.retries,0);
+            assert!(update.modify(|_| panic!("stale attempt updated a new row")).is_none());
+            queue.cancel(job.id);
+            queue.clear_finished();
+        }
+        queue.shutdown();
+    }
+
+    #[test]
+    fn reset_output_naming_preserves_existing_files() {
+        let root = std::env::temp_dir().join(format!("dotorca-reset-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        let base = source.with_extension("mp4");
+        fs::write(&base, b"previous output").unwrap();
+        assert_eq!(output_path(&root,&source,false).unwrap(),base);
+        let second = output_path(&root,&source,true).unwrap();
+        assert!(second.file_name().unwrap().to_string_lossy().ends_with(" (2).mp4"));
+        fs::write(&second,b"second output").unwrap();
+        let third = output_path(&root,&source,true).unwrap();
+        assert!(third.file_name().unwrap().to_string_lossy().ends_with(" (3).mp4"));
+        assert_eq!(fs::read(&base).unwrap(),b"previous output");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1125,6 +1225,20 @@ mod tests {
         assert!(queue.snapshot().is_empty());
         assert!(source.exists());
         assert!(jobs[0].output.as_ref().unwrap().is_file());
+        // Re-add the same source, first demonstrate a normal conflict, then
+        // reset it and successfully produce a separate file using new settings.
+        let repeat_id = queue.add(&source).unwrap();
+        queue.start(settings()).unwrap();
+        assert_eq!(await_finished(&queue)[0].phase, Phase::Failed);
+        queue.reset(repeat_id).unwrap();
+        let changed = Settings::new(1, Codec::H264, 192).unwrap();
+        queue.start(changed).unwrap();
+        let repeat = await_finished(&queue);
+        assert_eq!(repeat[0].phase, Phase::Published, "{:?}",repeat[0]);
+        assert_ne!(repeat[0].output,jobs[0].output);
+        assert!(repeat[0].target_info.as_deref().unwrap().contains("192 × 108"));
+        assert!(jobs[0].output.as_ref().unwrap().is_file());
+        queue.clear_finished();
         let percent_source = root.join("percent 🎬.avi");
         fs::copy(&source, &percent_source).unwrap();
         let source_bytes = fs::metadata(&percent_source).unwrap().len();

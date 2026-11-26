@@ -26,7 +26,7 @@ extern int32_t orca_frame(char *out, size_t capacity, uint32_t *count);
 extern int32_t orca_row(uint32_t index, orca_job_row *out, size_t capacity);
 extern int32_t orca_detail(uint32_t index, char *out, size_t capacity);
 
-enum { CANCEL = 1, CLEAR_FINISHED, CLEAR_ALL };
+enum { CANCEL = 1, CLEAR_FINISHED, CLEAR_ALL, RESET };
 static const uint32_t edges[] = { 3840, 2560, 1920, 1280 };
 
 typedef struct {
@@ -108,7 +108,12 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
                 window->expanded = window->expanded == job.id ? 0 : job.id;
                 cui_request_redraw(ui);
             }
-            if (cui_button(ui, "Cancel", .disabled = (job.flags & 1u) == 0)) {
+            if (job.flags & 2u) {
+                if (cui_button(ui, "Reset")) {
+                    if (window->expanded == job.id) window->expanded = 0;
+                    action(ui, window, RESET, job.id);
+                }
+            } else if (cui_button(ui, "Cancel", .disabled = (job.flags & 1u) == 0)) {
                 action(ui, window, CANCEL, job.id);
             }
         }
