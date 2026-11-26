@@ -36,6 +36,17 @@ fn drain(mut r: impl Read, limit: usize) -> io::Result<Capture> {
     Ok(Capture { bytes, discarded })
 }
 pub fn run(req: &Request, cancelled: &AtomicBool) -> io::Result<Outcome> {
+    let (outcome, stdout) = run_with_stdout(req, cancelled, |reader| drain(reader, req.stdout_limit))?;
+    Ok(Outcome { stdout: stdout?, ..outcome })
+}
+
+/// Stream large stdout results through a caller-supplied reader while still
+/// draining stderr and applying the normal cancellation and process-tree rules.
+pub(crate) fn run_with_stdout<T: Send>(
+    req: &Request,
+    cancelled: &AtomicBool,
+    read_stdout: impl FnOnce(std::process::ChildStdout) -> T + Send,
+) -> io::Result<(Outcome, T)> {
     if !req.exe.is_absolute() { return Err(io::Error::new(io::ErrorKind::InvalidInput,"absolute executable path required")); }
     // Rust on Windows may implicitly invoke cmd.exe for .bat/.cmd. Permit PE .exe tools only.
     #[cfg(windows)]
@@ -51,7 +62,7 @@ pub fn run(req: &Request, cancelled: &AtomicBool) -> io::Result<Outcome> {
     let start = Instant::now();
     // Scoped readers are independent of caller/UI, and always drain both pipes.
     thread::scope(|scope| {
-        let a = scope.spawn(move || drain(stdout, req.stdout_limit));
+        let a = scope.spawn(move || read_stdout(stdout));
         let b = scope.spawn(move || drain(stderr, req.stderr_limit));
         let result = loop {
             match child.try_wait() {
@@ -72,10 +83,10 @@ pub fn run(req: &Request, cancelled: &AtomicBool) -> io::Result<Outcome> {
         tree.terminate();
         drop(tree);
         if result.is_err() { let _ = child.kill(); let _ = child.wait(); }
-        let stdout = a.join().map_err(|_| io::Error::other("stdout reader panicked"))??;
+        let stdout = a.join().map_err(|_| io::Error::other("stdout reader panicked"))?;
         let stderr = b.join().map_err(|_| io::Error::other("stderr reader panicked"))??;
         let (stop,status) = result?;
-        Ok(Outcome { stop, status, stdout, stderr })
+        Ok((Outcome { stop, status, stdout: Capture { bytes: Vec::new(), discarded: 0 }, stderr }, stdout))
     })
 }
 #[cfg(test)]

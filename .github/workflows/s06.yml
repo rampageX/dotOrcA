@@ -1,0 +1,93 @@
+name: S06 production pipeline
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - 'crates/core/Cargo.toml'
+      - 'crates/core/src/lib.rs'
+      - 'crates/core/src/pipeline.rs'
+      - 'crates/core/src/pipeline/**'
+      - 'crates/core/src/process*'
+      - 'crates/core/src/process/**'
+      - 'crates/core/src/media.rs'
+      - 'crates/core/src/hardware.rs'
+      - 'crates/core/src/hardware/**'
+      - 'crates/core/src/budget.rs'
+      - 'crates/core/src/decision.rs'
+      - '.github/workflows/s06.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pipeline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run actual encoding and transactional validation
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            choco install ffmpeg-full --version=9.1.0 -y --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $package = Join-Path $env:ChocolateyInstall 'lib\ffmpeg-full\tools'
+            $bin = (Get-ChildItem -LiteralPath $package -Recurse -File -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+            if (-not $bin) { throw 'FFmpeg full executable missing' }
+            $env:DOTORCA_TEST_FFMPEG = Join-Path $bin 'ffmpeg.exe'
+            $env:DOTORCA_TEST_FFPROBE = Join-Path $bin 'ffprobe.exe'
+            $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          } else {
+            if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+              sudo apt-get update
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              sudo apt-get install -y ffmpeg
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            }
+            $env:DOTORCA_TEST_FFMPEG = (Get-Command ffmpeg -CommandType Application | Select-Object -First 1).Source
+            $env:DOTORCA_TEST_FFPROBE = (Get-Command ffprobe -CommandType Application | Select-Object -First 1).Source
+          }
+          if ($IsWindows) {
+            $vhd = Join-Path $env:RUNNER_TEMP 'dotorca-full-test.vhd'
+            $script = Join-Path $env:RUNNER_TEMP 'dotorca-vhd.txt'
+            try {
+              @(
+                "create vdisk file=`"$vhd`" maximum=32 type=fixed"
+                "select vdisk file=`"$vhd`""
+                'attach vdisk'
+                'create partition primary'
+                'format fs=ntfs quick label=DotOrcAFill'
+                'assign'
+              ) | Set-Content -LiteralPath $script -Encoding ascii
+              & diskpart.exe /s $script
+              if ($LASTEXITCODE) { throw "DiskPart setup failed ($LASTEXITCODE)" }
+              $volume = Get-Volume -FileSystemLabel 'DotOrcAFill'
+              if (-not $volume.DriveLetter) { throw 'Test volume has no drive letter' }
+              $testRoot = Join-Path "$($volume.DriveLetter):\" 'dotOrcA-test'
+              New-Item -ItemType Directory -Path $testRoot -ErrorAction Stop | Out-Null
+              $env:DOTORCA_TEST_FULL_ROOT = $testRoot
+              cargo test --locked -p orca-core production_special_path -- --ignored --nocapture
+              if ($LASTEXITCODE) { throw "Pipeline regression failed ($LASTEXITCODE)" }
+            } finally {
+              if (Test-Path -LiteralPath $vhd) {
+                @("select vdisk file=`"$vhd`"", 'detach vdisk') |
+                  Set-Content -LiteralPath $script -Encoding ascii
+                & diskpart.exe /s $script
+                if ($LASTEXITCODE) { throw "DiskPart detach failed ($LASTEXITCODE)" }
+                Remove-Item -LiteralPath $vhd -ErrorAction Stop
+              }
+              Remove-Item -LiteralPath $script -ErrorAction SilentlyContinue
+            }
+          } else {
+            cargo test --locked -p orca-core production_special_path -- --ignored --nocapture
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
