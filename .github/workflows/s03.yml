@@ -32,6 +32,9 @@ jobs:
           Remove-Item -LiteralPath $bad
           New-Item -ItemType Directory -Force dist-s03 | Out-Null
           $info | ConvertTo-Json -Depth 20 | Out-File dist-s03/info.json
+          $holdout = & $exe --holdout | ConvertFrom-Json
+          if ($LASTEXITCODE -or $holdout.groups.Count -ne 6 -or ($holdout.groups | Measure-Object -Property predicted -Sum).Sum -ne 144 -or $holdout.confidence_calibrated) { throw 'Invalid holdout diagnostics' }
+          $holdout | ConvertTo-Json -Depth 20 | Out-File dist-s03/holdout.json
       - name: Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
