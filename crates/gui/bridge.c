@@ -228,14 +228,14 @@ int orca_cui_self_test(void) {
     uint32_t count = 0;
     orca_job_row a, b;
     result = 12;
-    if (orca_frame(status, sizeof(status), &count) != 0 || count != 2 ||
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 2 ||
         orca_row(0, &a, sizeof(a)) != 1 || orca_row(1, &b, sizeof(b)) != 1 ||
         strcmp(a.name, "小K 的鹅腿坟场 & (黑洞) ^ % !.avi") ||
         strcmp(b.name, "-movie 🎬.mp4")) goto done;
     result = 13;
-    if (orca_action(CANCEL, b.id) != 1 || orca_frame(status, sizeof(status), &count) != 0 ||
+    if (orca_action(CANCEL, b.id) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         !strstr(status, "1 cancelled")) goto done;
-    if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) != 0 ||
+    if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 1) goto done;
     result = 0;
 done:

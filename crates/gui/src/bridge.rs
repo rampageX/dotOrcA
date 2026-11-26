@@ -149,7 +149,7 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
         let active = app
             .snapshot
             .iter()
-            .any(|j| !j.phase.finished() && j.phase != Phase::Waiting);
+            .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
         let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {failed} failed   |   {} cancelled", finished - published - failed);
         if !app.notice.is_empty() {
             text.push_str("   |   ");
@@ -161,6 +161,38 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
         }
         i32::from(active)
     })
+}
+
+fn readable_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    for (unit, label) in [(TIB, "TiB"), (GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
+        if bytes >= unit {
+            return format!("{:.2} {label}", bytes as f64 / unit as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
+fn source_size(job: &Job) -> String {
+    if job.source_size_pending {
+        "reading…".into()
+    } else {
+        job.source_bytes.map_or_else(|| "unknown".into(), readable_size)
+    }
+}
+
+fn diagnostic_preview(error: &str) -> String {
+    // Keep the beginning and end of the captured diagnostic, rather than
+    // discarding the actual error after a long FFmpeg prefix.
+    if error.len() <= 16 * 1024 {
+        return error.to_owned();
+    }
+    let first = error.floor_char_boundary(4096);
+    let last = error.ceil_char_boundary(error.len() - 12 * 1024);
+    format!("{}\n[Diagnostic shortened in UI; see task log.]\n{}", &error[..first], &error[last..])
 }
 
 #[repr(C)]
@@ -201,24 +233,29 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Preflight => "Checking route",
             Phase::Encoding => "Encoding",
             Phase::Validating => "Validating output",
-            Phase::Retrying => "Adjusting bitrate",
+            Phase::Retrying => "Retrying (capacity)",
             Phase::Cancelling => "Cancelling",
             Phase::Published => "Saved",
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
         let mut status = format!(
-            "{phase}  |  {} MiB max  |  {:?}  |  {} px max",
+            "{phase}  |  Source {}  |  Target ≤ {} MiB  |  {:?}  |  {} px max",
+            source_size(job),
             job.settings.limit_mib(),
             job.settings.codec(),
             job.settings.max_long_edge()
         );
+        if job.retries > 0 {
+            status.push_str(&format!("  |  Retries {}", job.retries));
+        }
         if let Some(encoder) = job.encoder {
             status.push_str(&format!("  |  {encoder}"));
         }
         if let (Some(bytes), Some(elapsed)) = (job.bytes, job.elapsed) {
             status.push_str(&format!(
-                "  |  {bytes} bytes in {:.1} s",
+                "  |  Output {} in {:.1} s",
+                readable_size(bytes),
                 elapsed.as_secs_f64()
             ));
         } else if !job.phase.finished() {
@@ -252,7 +289,13 @@ pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usi
         let Some(job) = app.snapshot.get(index as usize) else {
             return 0;
         };
-        let mut text = format!("Source: {}", job.source.display());
+        let mut text = String::new();
+        if let Some(error) = &job.encoder_error {
+            text.push_str("FFmpeg/process diagnostic:\n");
+            text.push_str(&diagnostic_preview(error));
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("Source size: {}\nSource: {}", source_size(job), job.source.display()));
         if let Some(output) = &job.output {
             text.push_str(&format!("\nOutput: {}", output.display()));
         }
@@ -267,6 +310,19 @@ pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_size_and_diagnostic_preserve_units_and_error_tail() {
+        assert_eq!(readable_size(0), "0 B");
+        assert_eq!(readable_size(1024), "1.00 KiB");
+        assert_eq!(readable_size(1048576), "1.00 MiB");
+        assert_eq!(readable_size(1 << 40), "1.00 TiB");
+        let long = format!("start {}\nencoder failed", "中文🎬".repeat(4000));
+        let preview = diagnostic_preview(&long);
+        assert!(preview.starts_with("start"));
+        assert!(preview.ends_with("encoder failed"));
+        assert!(preview.len() < 17000);
+    }
 
     #[test]
     fn boundary_copies_paths_validates_sizes_and_keeps_frame_consistent() {
@@ -301,10 +357,7 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(
-                orca_frame(message.as_mut_ptr(), message.len(), &mut count),
-                0
-            );
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 1);
             let mut row = std::mem::MaybeUninit::<Row>::uninit();
             assert_eq!(orca_row(0, row.as_mut_ptr(), 1), -1);
@@ -322,10 +375,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
-            assert_eq!(
-                orca_frame(message.as_mut_ptr(), message.len(), &mut count),
-                0
-            );
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
             assert!(std::ffi::CStr::from_ptr(message.as_ptr())
                 .to_str()

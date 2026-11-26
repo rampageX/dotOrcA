@@ -81,6 +81,8 @@ impl Phase {
 pub struct Job {
     pub id: u32,
     pub source: PathBuf,
+    pub source_bytes: Option<u64>,
+    pub source_size_pending: bool,
     pub settings: Settings,
     pub phase: Phase,
     pub encoder: Option<&'static str>,
@@ -92,6 +94,8 @@ pub struct Job {
     pub elapsed: Option<Duration>,
     pub selection: Option<Selection>,
     pub detail: Vec<String>,
+    pub encoder_error: Option<String>,
+    pub retries: u32,
 }
 
 struct Entry {
@@ -110,6 +114,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     ready: Condvar,
+    size_ready: Condvar,
 }
 
 pub struct Queue {
@@ -138,6 +143,7 @@ impl Queue {
                 if std::panic::catch_unwind(|| run(&background)).is_err() {
                     let mut state = background.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.closing = true;
+                    background.size_ready.notify_one();
                     for entry in &mut state.entries {
                         if !entry.view.phase.finished() {
                             let job = Arc::make_mut(&mut entry.view);
@@ -147,6 +153,16 @@ impl Queue {
                     }
                 }
             })?;
+        // A separate bounded metadata worker also services queued files while
+        // encoding is active. It holds no lock during filesystem access.
+        let sizes = Arc::clone(&shared);
+        if let Err(error) = thread::Builder::new()
+            .name("dotOrcA source sizes".into())
+            .spawn(move || read_source_sizes(&sizes))
+        {
+            Self { shared, worker }.shutdown();
+            return Err(error);
+        }
         Ok(Self { shared, worker })
     }
 
@@ -170,6 +186,8 @@ impl Queue {
             view: Arc::new(Job {
                 id,
                 source: source.into(),
+                source_bytes: None,
+                source_size_pending: true,
                 settings,
                 phase: Phase::Waiting,
                 encoder: None,
@@ -181,9 +199,12 @@ impl Queue {
                 elapsed: None,
                 selection: None,
                 detail: Vec::new(),
+                encoder_error: None,
+                retries: 0,
             }),
             cancel: Arc::new(AtomicBool::new(false)),
         });
+        self.shared.size_ready.notify_one();
         Ok(id)
     }
 
@@ -234,8 +255,33 @@ impl Queue {
                 cancel_entry(entry);
             }
             self.shared.ready.notify_one();
+            self.shared.size_ready.notify_one();
         }
+        // Do not join a metadata call that may be blocked by an offline UNC
+        // share. The detached reader owns only Shared and exits on closing.
         let _ = self.worker.join();
+    }
+}
+
+fn read_source_sizes(shared: &Shared) {
+    loop {
+        let (id, path) = {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if state.closing {
+                    return;
+                }
+                if let Some(entry) = state.entries.iter().find(|e| e.view.source_size_pending) {
+                    break (entry.view.id, entry.view.source.clone());
+                }
+                state = shared.size_ready.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let bytes = fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len());
+        Updates { shared, id }.modify(|job| {
+            job.source_bytes = bytes;
+            job.source_size_pending = false;
+        });
     }
 }
 
@@ -367,16 +413,18 @@ fn observe(job: &mut Job, event: Event<'_>) {
             job.progress_percent = None;
         }
         Event::RouteFailed { route, detail } => {
-            note(
-                job,
-                format!("{} failed: {detail}", route.encoder(job.settings.codec)),
-            );
+            job.encoder_error = Some(detail.to_owned());
+            note(job, format!("{} failed.", route.encoder(job.settings.codec)));
         }
         Event::Oversize {
             measured,
             next_video_bps,
         } => {
             job.phase = Phase::Retrying;
+            job.progress_percent = None;
+            if next_video_bps.is_some() {
+                job.retries += 1;
+            }
             note(
                 job,
                 format!(
@@ -488,6 +536,10 @@ fn encode(
             Err(error) => {
                 job.phase = Phase::Failed;
                 let detail = match error {
+                    pipeline::Error::Process(detail) => {
+                        job.encoder_error = Some(detail);
+                        "FFmpeg/process failed. See diagnostic above.".into()
+                    }
                     pipeline::Error::HardwareRouteUnavailable => "No compatible hardware route. See the preflight or encoding failure details.".into(),
                     pipeline::Error::DestinationExists => {
                         "Output conflict: a file with this name already exists in output/.".into()
@@ -506,7 +558,13 @@ fn encode(
         if let Err(error) = write_log(root, job) {
             note(job, format!("Portable log write failed: {error}"));
         }
-        update.modify(|job| *job = completed);
+        update.modify(|job| {
+            // The size reader may have completed while the terminal log was
+            // being written; never replace its newer metadata with a stale copy.
+            completed.source_bytes = job.source_bytes;
+            completed.source_size_pending = job.source_size_pending;
+            *job = completed;
+        });
     }
 }
 
@@ -547,6 +605,51 @@ mod tests {
             assert!(Instant::now() < deadline, "{jobs:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn source_sizes_arrive_without_start_and_handle_missing_paths() {
+        let root = std::env::temp_dir().join(format!("dotorca-size-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        fs::write(&path, [0u8; 1234]).unwrap();
+        let queue = Queue::spawn(|shared| work(shared, |_, _, _| unreachable!())).unwrap();
+        queue.add(&path, settings()).unwrap();
+        queue.add(&root.join("-missing 🎬.mp4"), settings()).unwrap();
+        queue.add(&root, settings()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let jobs = queue.snapshot();
+            assert!(jobs.iter().all(|j| j.phase == Phase::Waiting));
+            if jobs.iter().all(|j| !j.source_size_pending) {
+                assert_eq!(jobs[0].source_bytes, Some(1234));
+                assert_eq!(jobs[1].source_bytes, None);
+                assert_eq!(jobs[2].source_bytes, None);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{jobs:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+        queue.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_and_encoder_error_keep_diagnostic() {
+        let queue = Queue::spawn(|shared| work(shared, |_, _, _| unreachable!())).unwrap();
+        let id = queue.add(&std::env::temp_dir().join("test.mp4"), settings()).unwrap();
+        let update = Updates { shared: &queue.shared, id };
+        let error = format!("{}\nactual encoder error", "x".repeat(500));
+        update.modify(|job| {
+            job.progress_percent = Some(100);
+            observe(job, Event::Oversize { measured: 2000000, next_video_bps: Some(100000) });
+            assert_eq!(job.phase, Phase::Retrying);
+            assert_eq!(job.progress_percent, None);
+            assert_eq!(job.retries, 1);
+            observe(job, Event::RouteFailed { route: crate::decision::Route::Software, detail: &error });
+            assert_eq!(job.encoder_error.as_deref(), Some(error.as_str()));
+        });
+        queue.shutdown();
     }
 
     #[test]
