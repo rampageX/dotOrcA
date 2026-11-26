@@ -159,6 +159,10 @@ pub(super) struct Summary {
 }
 
 impl Summary {
+    pub fn video_frames(&self) -> usize {
+        self.video.frames
+    }
+
     pub fn require_continuous_audio(&self) -> Result<(), Error> {
         if self.audio.iter().any(|track| track.gaps != 0) {
             return Err(Error::UnsupportedMedia(

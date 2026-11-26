@@ -9,3 +9,4 @@ pub mod budget;
 pub mod decision;
 pub mod pipeline;
 pub mod dataset;
+pub mod queue;
