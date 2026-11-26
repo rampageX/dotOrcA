@@ -2,24 +2,27 @@
 //! one immutable snapshot per frame. No worker calls back into C.
 use orca_core::{
     budget::Codec,
+    localized, message,
+    text::{self, Language, Msg},
     queue::{Job, Phase, Queue, Settings, Target},
 };
-use std::{cell::RefCell, ffi::c_char, path::Path, ptr, sync::Arc};
+use std::{cell::RefCell, ffi::c_char, fs, io, path::{Path, PathBuf}, ptr, sync::Arc};
 
 #[derive(Default)]
 struct Gui {
     queue: Option<Queue>,
     snapshot: Vec<Arc<Job>>,
     notice: String,
+    language: Language,
 }
 
 impl Gui {
     fn queue(&mut self) -> Result<&Queue, String> {
         if self.queue.is_none() {
-            let exe = std::env::current_exe().map_err(|e| format!("Cannot locate EXE: {e}"))?;
-            let root = exe.parent().ok_or("EXE directory is unavailable.")?;
+            let exe = std::env::current_exe().map_err(|e| message!(LocateExe,e))?;
+            let root = exe.parent().ok_or(text::en(Msg::ExeDirectory))?;
             self.queue =
-                Some(Queue::portable(root.into()).map_err(|e| format!("Cannot start queue: {e}"))?);
+                Some(Queue::portable(root.into()).map_err(|e| message!(StartQueue,e))?);
         }
         Ok(self.queue.as_ref().expect("initialized queue"))
     }
@@ -42,17 +45,114 @@ fn boundary(action: impl FnOnce(&mut Gui) -> i32) -> i32 {
         .unwrap_or(-1)
 }
 
+
+fn config_path(name: &str) -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let parent = exe.parent().ok_or_else(|| io::Error::other(text::en(Msg::ExeDirectory)))?;
+    Ok(parent.join("config").join(name))
+}
+fn save_config(name: &str, value: &str) -> io::Result<()> {
+    let path = config_path(name)?;
+    fs::create_dir_all(path.parent().expect("config parent"))?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temporary, value)?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+fn read_config(name: &str) -> io::Result<Option<String>> {
+    match fs::read_to_string(config_path(name)?) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+#[no_mangle]
+pub extern "C" fn orca_ui_init(system_zh: i32) -> i32 {
+    boundary(|app| {
+        app.language = if system_zh != 0 { Language::Zh } else { Language::En };
+        match read_config("ui-language.txt") {
+            Ok(Some(s)) => match s.trim() {
+                "zh-CN" => app.language = Language::Zh,
+                "en" => app.language = Language::En,
+                _ => {}
+            },
+            Err(e) => app.notice = message!(ConfigRead,e),
+            Ok(None) => {}
+        }
+        i32::from(app.language == Language::Zh)
+    })
+}
+fn language() -> Language {
+    APP.try_with(|app| app.try_borrow().map_or(Language::En, |app| app.language)).unwrap_or(Language::En)
+}
+#[no_mangle]
+pub extern "C" fn orca_label(id: u32) -> *const c_char {
+    text::label(language(), id).as_ptr()
+}
+#[no_mangle]
+pub extern "C" fn orca_set_language(zh: i32) -> i32 {
+    boundary(|app| {
+        app.language = if zh != 0 { Language::Zh } else { Language::En };
+        match save_config("ui-language.txt", if zh != 0 { "zh-CN\n" } else { "en\n" }) {
+            Ok(()) => { app.notice.clear(); 1 },
+            Err(e) => { app.notice = message!(ConfigError,e); 0 },
+        }
+    })
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Placement { x:i32, y:i32, width:i32, height:i32, state:i32, has_position:i32 }
+impl Placement {
+    fn valid(&self) -> bool {
+        (360..=8192).contains(&self.width) && (280..=8192).contains(&self.height)
+            && (0..=1).contains(&self.state) && (0..=1).contains(&self.has_position)
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_load_placement(out: *mut Placement) -> i32 {
+    if out.is_null() || !out.is_aligned() { return -1; }
+    boundary(|app| {
+        match read_config("details-placement.txt") {
+            Ok(Some(s)) => {
+                let Ok(values) = s.split_whitespace().map(str::parse::<i32>).collect::<Result<Vec<_>,_>>() else { return 0; };
+                let [x,y,width,height,state,has_position] = values.as_slice() else { return 0; };
+                let p = Placement{x:*x,y:*y,width:*width,height:*height,state:*state,has_position:*has_position};
+                if !p.valid() { return 0; }
+                unsafe { out.write(p) };
+                1
+            }
+            Err(e) => { app.notice = message!(ConfigRead,e); 0 }
+            Ok(None) => 0,
+        }
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_save_placement(value: *const Placement) -> i32 {
+    if value.is_null() || !value.is_aligned() { return -1; }
+    boundary(|app| {
+        let p = unsafe { value.read() };
+        if !p.valid() { return 0; }
+        match save_config("details-placement.txt", &format!("{} {} {} {} {} {}\n",p.x,p.y,p.width,p.height,p.state,p.has_position)) {
+            Ok(()) => 1,
+            Err(e) => { app.notice = message!(ConfigError,e); 0 }
+        }
+    })
+}
+
 // SAFETY: the caller supplies a readable buffer of len bytes, held for this
 // call. The limit is larger than a UTF-8 Windows extended-length path.
 unsafe fn utf8<'a>(value: *const c_char, len: usize, max: usize) -> Result<&'a str, &'static str> {
     if value.is_null() || len == 0 || len > max {
-        return Err("Invalid path or capacity field length.");
+        return Err(text::en(Msg::InvalidLength));
     }
     let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
     std::str::from_utf8(bytes)
         .ok()
         .filter(|value| !value.contains('\0'))
-        .ok_or("Invalid UTF-8 in path or capacity field.")
+        .ok_or(text::en(Msg::InvalidUtf8))
 }
 
 // SAFETY: out has capacity writable bytes for the duration of the call.
@@ -104,17 +204,17 @@ pub unsafe extern "C" fn orca_start(
             let value = unsafe { utf8(size, size_len, 24) }?
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| "Enter a whole number for the target.")?;
+                .map_err(|_| text::en(Msg::WholeTarget))?;
             let codec = match codec {
                 0 => Codec::H264,
                 1 => Codec::Hevc,
                 2 => Codec::Av1,
-                _ => return Err("Invalid output codec.".into()),
+                _ => return Err(text::en(Msg::InvalidCodec).into()),
             };
             let settings = match mode {
                 0 => Settings::new(value, codec, edge)?,
                 1 => Settings::percentage(value, codec, edge)?,
-                _ => return Err("Invalid capacity mode.".into()),
+                _ => return Err(text::en(Msg::InvalidMode).into()),
             };
             app.queue()?.start(settings)?;
             Ok::<_, String>(())
@@ -176,13 +276,15 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .snapshot
             .iter()
             .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
-        let mut text = format!("{finished}/{total} finished   |   {slots} slots   |   {published} saved   |   {skipped} skipped   |   {failed} failed   |   {} cancelled", finished - published - skipped - failed);
+        let lang = app.language;
+        let mut text = localized!(lang, QueueSummary,finished,total,slots,published,skipped,failed,finished-published-skipped-failed);
         if clearing {
-            text.push_str("   |   Stopping and clearing all tasks…");
+            text.push_str("   |   ");
+            text.push_str(text::literal(lang, Msg::Clearing));
         }
         if !app.notice.is_empty() {
             text.push_str("   |   ");
-            text.push_str(&app.notice);
+            text.push_str(&text::localize(lang, &app.notice));
         }
         unsafe {
             *count = total as u32;
@@ -205,15 +307,15 @@ fn readable_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-fn source_size(job: &Job) -> String {
+fn source_size(job: &Job, lang: Language) -> String {
     if job.source_size_pending {
-        "reading…".into()
+        text::literal(lang,Msg::Reading).into()
     } else {
-        job.source_bytes.map_or_else(|| "unknown".into(), readable_size)
+        job.source_bytes.map_or_else(|| text::literal(lang,Msg::Unknown).into(), readable_size)
     }
 }
 
-fn diagnostic_preview(error: &str) -> String {
+fn diagnostic_preview(error: &str, lang: Language) -> String {
     // Keep the beginning and end of the captured diagnostic, rather than
     // discarding the actual error after a long FFmpeg prefix.
     if error.len() <= 16 * 1024 {
@@ -221,7 +323,24 @@ fn diagnostic_preview(error: &str) -> String {
     }
     let first = error.floor_char_boundary(4096);
     let last = error.ceil_char_boundary(error.len() - 12 * 1024);
-    format!("{}\n[Diagnostic shortened in UI; see task log.]\n{}", &error[..first], &error[last..])
+    format!("{}\n{}\n{}", &error[..first], text::literal(lang,Msg::DiagnosticShort), &error[last..])
+}
+
+fn phase_text(phase: Phase, lang: Language) -> &'static str { text::literal(lang, match phase {
+    Phase::Waiting => Msg::Queued, Phase::Ready => Msg::WaitingWorker, Phase::Inspecting => Msg::Inspecting,
+    Phase::Preflight => Msg::Checking, Phase::Encoding => Msg::Encoding, Phase::Validating => Msg::Validating,
+    Phase::Retrying => Msg::Retrying, Phase::Cancelling => Msg::Cancelling, Phase::Published => Msg::Saved,
+    Phase::Skipped => Msg::Skipped, Phase::Failed => Msg::Failed, Phase::Cancelled => Msg::Cancelled,
+}) }
+fn target_text(job: &Job, lang: Language) -> Option<String> {
+    let settings = job.settings?;
+    Some(match settings.target() {
+        Target::Bytes(bytes) => format!("{} MiB", bytes / 1_048_576),
+        Target::Percent(percent) => {
+            let bytes = job.target_bytes.or_else(|| job.source_bytes.map(|n| settings.limit_bytes(n)));
+            format!("{percent}% ({})", bytes.map_or_else(|| text::literal(lang,Msg::SizeUnknown).into(),readable_size))
+        }
+    })
 }
 
 #[repr(C)]
@@ -255,71 +374,27 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             .file_name()
             .unwrap_or(job.source.as_os_str())
             .to_string_lossy();
-        let phase = match job.phase {
-            Phase::Waiting => "Queued",
-            Phase::Ready => "Waiting for worker",
-            Phase::Inspecting => "Inspecting source / hardware",
-            Phase::Preflight => "Checking route",
-            Phase::Encoding => "Encoding",
-            Phase::Validating => "Validating output",
-            Phase::Retrying => "Retrying (capacity)",
-            Phase::Cancelling => "Cancelling",
-            Phase::Published => "Saved",
-            Phase::Skipped => "Skipped",
-            Phase::Failed => "Failed",
-            Phase::Cancelled => "Cancelled",
-        };
+        let lang = app.language;
+        let phase = phase_text(job.phase,lang);
         let phase = if let Some(reason) = job.failure.as_deref().or(job.skip_reason) {
-            format!("{phase}: {reason}")
+            format!("{phase}: {}",text::localize(lang,reason))
         } else { phase.to_owned() };
-        let mut status = format!("{phase}  |  Source {}", source_size(job));
+        let mut status = format!("{phase}  |  {}",localized!(lang,SourceStatus,source_size(job,lang)));
         if let Some(settings) = job.settings {
-            let target = match settings.target() {
-                Target::Bytes(bytes) => format!("{} MiB", bytes / 1_048_576),
-                Target::Percent(percent) => {
-                    let bytes = job.target_bytes.or_else(|| job.source_bytes.map(|n| settings.limit_bytes(n)));
-                    match bytes {
-                        Some(n) => format!("{percent}% ({})", readable_size(n)),
-                        None => format!("{percent}% (size unknown)"),
-                    }
-                }
-            };
-            status.push_str(&format!("  |  Target ≤ {target}"));
+            let target = target_text(job,lang).unwrap_or_default();
+            status.push_str(&format!("  |  {}",localized!(lang,TargetStatus,target)));
             if job.phase != Phase::Skipped {
-                status.push_str(&format!("  |  {:?}  |  {} px max", settings.codec(), settings.max_long_edge()));
+                status.push_str(&format!("  |  {:?}  |  {}",settings.codec(),localized!(lang,MaxStatus,settings.max_long_edge())));
             } else {
-                status.push_str("  |  Original retained");
+                status.push_str(&format!("  |  {}",text::literal(lang,Msg::OriginalRetained)));
             }
         } else if job.phase == Phase::Waiting {
-            status.push_str("  |  Settings applied on Start");
+            status.push_str(&format!("  |  {}",text::literal(lang,Msg::SettingsStart)));
         }
-        if job.retries > 0 {
-            status.push_str(&format!("  |  Retries {}", job.retries));
-        }
-        if let Some(encoder) = job.encoder {
-            status.push_str(&format!("  |  {encoder}"));
-        }
-        if let (Some(bytes), Some(elapsed)) = (job.bytes, job.elapsed) {
-            status.push_str(&format!(
-                "  |  Output {} in {:.1} s",
-                readable_size(bytes),
-                elapsed.as_secs_f64()
-            ));
-        } else if !job.phase.finished() {
-            let eta = job.eta.map_or_else(
-                || "unknown".into(),
-                |eta| {
-                    format!(
-                        "{:.1}–{:.1} s",
-                        eta.total.lower.as_secs_f64(),
-                        eta.total.upper.as_secs_f64()
-                    )
-                },
-            );
-            let size = job
-                .estimated_bytes
-                .map_or_else(|| "unknown".into(), |size| format!("{size} bytes"));
-            status.push_str(&format!("  |  ETA {eta}  |  Est. size {size}"));
+        if job.retries > 0 { status.push_str(&format!("  |  {}",localized!(lang,RetryStatus,job.retries))); }
+        if let Some(encoder) = job.encoder { status.push_str(&format!("  |  {encoder}")); }
+        if let (Some(bytes),Some(elapsed)) = (job.bytes,job.elapsed) {
+            status.push_str(&format!("  |  {}",localized!(lang,OutputStatus,readable_size(bytes),format!("{:.1}",elapsed.as_secs_f64()))));
         }
         unsafe {
             write_text(row.name.as_mut_ptr(), row.name.len(), &name);
@@ -330,36 +405,56 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
     })
 }
 
+fn detail_section(job: &Job, lang: Language, section: u32) -> String {
+    let mut lines = Vec::new();
+    match section {
+        0 => {
+            lines.push(localized!(lang,SourceSize,source_size(job,lang)));
+            lines.push(localized!(lang,SourcePath,job.source.display()));
+            lines.push(job.source_info.as_deref().map_or_else(||text::literal(lang,Msg::NoSourceMeta).into(),|s|text::lines(lang,s)));
+        }
+        1 => {
+            if let Some(target) = target_text(job,lang) { lines.push(localized!(lang,TargetStatus,target)); }
+            if let Some(settings) = job.settings { lines.push(format!("{:?} | {}",settings.codec(),localized!(lang,MaxStatus,settings.max_long_edge()))); }
+            if let Some(info) = &job.target_info { lines.push(localized!(lang,Planned,text::localize(lang,info))); }
+            if let Some(path) = &job.destination { lines.push(localized!(lang,Destination,path.display())); }
+        }
+        2 => {
+            if let Some(path) = &job.output { lines.push(localized!(lang,SavedOutput,path.display())); }
+            if let (Some(bytes),Some(elapsed)) = (job.bytes,job.elapsed) { lines.push(localized!(lang,OutputStatus,readable_size(bytes),format!("{:.1}",elapsed.as_secs_f64()))); }
+            if job.output.is_some() { lines.push(job.output_info.as_deref().map_or_else(||text::literal(lang,Msg::NoOutputMeta).into(),|s|text::lines(lang,s))); }
+        }
+        3 => {
+            lines.push(phase_text(job.phase,lang).into());
+            if let Some(reason) = job.skip_reason { lines.push(localized!(lang,SkipDetail,text::localize(lang,reason))); }
+            if let Some(encoder) = job.encoder { lines.push(encoder.into()); }
+            if let Some(p) = job.progress_percent { lines.push(format!("{p}%")); }
+            if job.retries > 0 { lines.push(localized!(lang,RetryStatus,job.retries)); }
+            lines.extend(job.detail.iter().map(|s|text::localize(lang,s)));
+        }
+        4 => {
+            if let Some(reason) = &job.failure { lines.push(localized!(lang,Failure,text::localize(lang,reason))); }
+            if let Some(error) = &job.encoder_error {
+                lines.push(text::literal(lang,Msg::ErrorHeader).into());
+                // The raw captured FFmpeg diagnostic is not translated.
+                lines.push(diagnostic_preview(error,lang));
+            }
+        }
+        _ => {}
+    }
+    if lines.is_empty() { lines.push(text::literal(lang,Msg::NotAvailable).into()); }
+    lines.join("\n")
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usize) -> i32 {
+pub unsafe extern "C" fn orca_detail(id: u32, section: u32, out: *mut c_char, capacity: usize) -> i32 {
     boundary(|app| {
-        let Some(job) = app.snapshot.get(index as usize) else {
-            return 0;
-        };
-        let mut text = String::new();
-        if let Some(error) = &job.encoder_error {
-            text.push_str("FFmpeg/process diagnostic:\n");
-            text.push_str(&diagnostic_preview(error));
-            text.push_str("\n\n");
-        }
-        if let Some(reason) = &job.failure { text.push_str(&format!("Failure: {reason}\n\n")); }
-        if let Some(reason) = job.skip_reason { text.push_str(&format!("Skipped: {reason}\n\n")); }
-        text.push_str(&format!("Source size: {}\nSource: {}", source_size(job), job.source.display()));
-        if let Some(info) = &job.source_info {
-            text.push_str(&format!("\n{info}"));
-        } else { text.push_str("\nSource media metadata not available."); }
-        if let Some(info) = &job.target_info { text.push_str(&format!("\n\nPlanned output: {info}")); }
-        if let Some(path) = &job.destination { text.push_str(&format!("\nDestination: {}", path.display())); }
-        if let Some(output) = &job.output {
-            text.push_str(&format!("\n\nSaved output: {}", output.display()));
-            if let Some(info) = &job.output_info { text.push_str(&format!("\n{info}")); }
-            else { text.push_str("\nActual output metadata unavailable."); }
-        }
-        for line in &job.detail {
-            text.push('\n');
-            text.push_str(line);
-        }
-        i32::from(unsafe { write_text(out, capacity, &text) })
+        let Some(job) = app.snapshot.iter().find(|job| job.id == id) else { return 0; };
+        let lang = app.language;
+        let text = if section < 5 { detail_section(job,lang,section) } else if section == 5 {
+            (0..5).map(|i|format!("{}\n{}",text::label(lang,24+i).to_string_lossy(),detail_section(job,lang,i))).collect::<Vec<_>>().join("\n\n")
+        } else { return -1; };
+        i32::from(unsafe { write_text(out,capacity,&text) })
     })
 }
 
@@ -374,7 +469,7 @@ mod tests {
         assert_eq!(readable_size(1048576), "1.00 MiB");
         assert_eq!(readable_size(1 << 40), "1.00 TiB");
         let long = format!("start {}\nencoder failed", "中文🎬".repeat(4000));
-        let preview = diagnostic_preview(&long);
+        let preview = diagnostic_preview(&long,Language::En);
         assert!(preview.starts_with("start"));
         assert!(preview.ends_with("encoder failed"));
         assert!(preview.len() < 17000);
@@ -417,14 +512,18 @@ mod tests {
             );
             assert!(std::ffi::CStr::from_ptr(row.status.as_ptr()).to_str().unwrap()
                 .contains("Settings applied on Start"));
+            APP.with_borrow_mut(|app| app.language = Language::Zh);
+            assert_eq!(orca_detail(row.id, 0, message.as_mut_ptr(), message.len()), 1);
+            assert!(std::ffi::CStr::from_ptr(message.as_ptr()).to_str().unwrap().contains("源文件"));
+            APP.with_borrow_mut(|app| app.language = Language::En);
             assert_eq!(orca_action(1, row.id), 1);
-            assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
+            assert_eq!(orca_detail(row.id, 3, message.as_mut_ptr(), message.len()), 1);
             assert!(!std::ffi::CStr::from_ptr(message.as_ptr())
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
-            assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
+            assert_eq!(orca_detail(row.id, 3, message.as_mut_ptr(), message.len()), 1);
             assert!(std::ffi::CStr::from_ptr(message.as_ptr())
                 .to_str()
                 .unwrap()
@@ -441,6 +540,8 @@ mod tests {
             let fresh_row = fresh_row.assume_init();
             assert_eq!(fresh_row.flags, 1);
             assert_ne!(fresh_row.id, reset_row.id);
+            assert_eq!(orca_detail(reset_row.id, 0, message.as_mut_ptr(), message.len()), 0);
+            assert_eq!(orca_detail(fresh_row.id, 0, message.as_mut_ptr(), message.len()), 1);
             assert_eq!(orca_action(4, fresh_row.id), 0);
             assert_eq!(orca_action(3, 0), 1);
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);

@@ -1,4 +1,4 @@
-//! S09 developer probe. Uses the production pipeline without writing learning data.
+//! S09 developer probe. Uses the production pipeline.
 use orca_core::{
     budget::Codec,
     hardware::{self, Detector},
@@ -150,9 +150,6 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         Ok(out) => json!({
             "published": true, "bytes": out.bytes, "encoder": out.route.encoder(codec),
             "selection": format!("{:?}", out.selection), "video_bps": out.video_bps,
-            "eta": out.production_eta.map(|e| json!({
-                "lower_ms": e.total.lower.as_millis(), "upper_ms": e.total.upper.as_millis(),
-            })),
         }),
         Err(error) => json!({"published": false, "error": format!("{error:?}")}),
     };

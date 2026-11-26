@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/core", "crates/benchmark", "crates/gui", "crates/s00-probe"]
-default-members = ["crates/core", "crates/benchmark", "crates/s00-probe"]
+members = ["crates/core", "crates/gui", "crates/s00-probe"]
+default-members = ["crates/core", "crates/s00-probe"]
 resolver = "2"
 
 [profile.release]

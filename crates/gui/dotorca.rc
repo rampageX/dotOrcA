@@ -1,8 +1,8 @@
 101 ICON "dotorca.ico"
 
 1 VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -14,9 +14,9 @@ BEGIN
   BLOCK "040904B0"
   BEGIN
    VALUE "FileDescription", "dotOrcA Video Compressor\0"
-   VALUE "FileVersion", "1.0.0\0"
+   VALUE "FileVersion", "1.1.0\0"
    VALUE "ProductName", "dotOrcA\0"
-   VALUE "ProductVersion", "1.0.0\0"
+   VALUE "ProductVersion", "1.1.0\0"
    VALUE "OriginalFilename", "dotorca.exe\0"
   END
  END

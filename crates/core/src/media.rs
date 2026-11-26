@@ -66,11 +66,11 @@ fn hdr(v:&Value)->Hdr {
 }
 pub fn parse(path:PathBuf,json:&[u8])->io::Result<MediaInfo> {
     let raw:Value=serde_json::from_slice(json).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;
-    let streams=raw.get("streams").and_then(Value::as_array).ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,"missing streams"))?;
-    let f=raw.get("format").filter(|v|v.is_object()).ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,"missing format"))?;
+    let streams=raw.get("streams").and_then(Value::as_array).ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,crate::text::en(crate::text::Msg::MissingStreams)))?;
+    let f=raw.get("format").filter(|v|v.is_object()).ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,crate::text::en(crate::text::Msg::MissingFormat)))?;
     let mut parsed=Vec::with_capacity(streams.len());
     for v in streams {
-        if !v.is_object(){return Err(io::Error::new(io::ErrorKind::InvalidData,"invalid stream"));}
+        if !v.is_object(){return Err(io::Error::new(io::ErrorKind::InvalidData,crate::text::en(crate::text::Msg::InvalidStream)));}
         parsed.push(Stream{
             index:integer(v,"index"),kind:string(v,"codec_type"),codec:string(v,"codec_name"),
             width:integer(v,"width").filter(|n|*n>0),height:integer(v,"height").filter(|n|*n>0),
@@ -88,13 +88,13 @@ pub fn probe(ffprobe:&Path,path:&Path,cancel:&AtomicBool)->io::Result<MediaInfo>
     // Absolute paths prevent leading-hyphen options from being interpreted as flags.
     let path=std::fs::canonicalize(path)?;
     let meta=std::fs::metadata(&path)?;
-    if !meta.is_file(){return Err(io::Error::new(io::ErrorKind::InvalidInput,"not a regular file"));}
+    if !meta.is_file(){return Err(io::Error::new(io::ErrorKind::InvalidInput,crate::text::en(crate::text::Msg::NotRegular)));}
     let req=Request::new(ffprobe).args(["-v","error","-show_format","-show_streams","-of","json","-i"]).args([OsString::from(&path)]);
     let result=process::run(&req,cancel)?;
     if result.stop!=Stop::Exited || !result.status.success() {
-        return Err(io::Error::other(format!("ffprobe {:?}: {}: {}",result.stop,result.status,String::from_utf8_lossy(&result.stderr.bytes))));
+        return Err(io::Error::other(crate::message!(ProbeError,format!("{:?}",result.stop),result.status,String::from_utf8_lossy(&result.stderr.bytes))));
     }
-    if result.stdout.discarded>0 {return Err(io::Error::new(io::ErrorKind::InvalidData,"ffprobe JSON exceeded capture limit"));}
+    if result.stdout.discarded>0 {return Err(io::Error::new(io::ErrorKind::InvalidData,crate::text::en(crate::text::Msg::ProbeLimit)));}
     let mut info=parse(path,&result.stdout.bytes)?;
     info.size_bytes=Some(meta.len());
     Ok(info)

@@ -47,13 +47,13 @@ pub(crate) fn run_with_stdout<T: Send>(
     cancelled: &AtomicBool,
     read_stdout: impl FnOnce(std::process::ChildStdout) -> T + Send,
 ) -> io::Result<(Outcome, T)> {
-    if !req.exe.is_absolute() { return Err(io::Error::new(io::ErrorKind::InvalidInput,"absolute executable path required")); }
+    if !req.exe.is_absolute() { return Err(io::Error::new(io::ErrorKind::InvalidInput,crate::text::en(crate::text::Msg::AbsoluteExe))); }
     // Rust on Windows may implicitly invoke cmd.exe for .bat/.cmd. Permit PE .exe tools only.
     #[cfg(windows)]
     if !req.exe.extension().and_then(|e|e.to_str()).is_some_and(|e|e.eq_ignore_ascii_case("exe")) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,"Windows executable must have .exe extension; batch files are prohibited"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,crate::text::en(crate::text::Msg::ExeExtension)));
     }
-    if cancelled.load(Ordering::Acquire) { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled before launch")); }
+    if cancelled.load(Ordering::Acquire) { return Err(io::Error::new(io::ErrorKind::Interrupted,crate::text::en(crate::text::Msg::CancelledLaunch))); }
     let mut command = Command::new(&req.exe);
     command.args(&req.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let (mut child, tree) = platform::spawn(&mut command)?;
@@ -83,8 +83,8 @@ pub(crate) fn run_with_stdout<T: Send>(
         tree.terminate();
         drop(tree);
         if result.is_err() { let _ = child.kill(); let _ = child.wait(); }
-        let stdout = a.join().map_err(|_| io::Error::other("stdout reader panicked"))?;
-        let stderr = b.join().map_err(|_| io::Error::other("stderr reader panicked"))??;
+        let stdout = a.join().map_err(|_| io::Error::other(crate::text::en(crate::text::Msg::StdoutPanic)))?;
+        let stderr = b.join().map_err(|_| io::Error::other(crate::text::en(crate::text::Msg::StderrPanic)))??;
         let (stop,status) = result?;
         Ok((Outcome { stop, status, stdout: Capture { bytes: Vec::new(), discarded: 0 }, stderr }, stdout))
     })

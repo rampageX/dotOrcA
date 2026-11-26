@@ -1,11 +1,9 @@
-# 架构 V1.1
+# 架构 V1.2（v1.1.0）
 
-Cargo Workspace，四个 crate：core（纯 Rust）、benchmark（独立 CLI，依赖 core）、gui（Rust UI adapter + C bridge）、s00-probe（独立测试计时器，非生产引擎）。默认成员不含 GUI；无需 CMake 或 C 编译器即可编译/测试核心与 Benchmark。S00 基线保留；S01 在 core 实现 media/hardware/process，不涉及 GUI。
+Cargo Workspace：core（纯 Rust）、gui（Rust UI adapter + C bridge）、s00-probe（仅开发测试）。核心无需 CUI/CMake/C 编译器。生产模块为 media/hardware/process、budget、decision、pipeline、queue；text 集中管理应用文本。S02/S03/S07 的 Benchmark、预测、训练数据及学习代码已移除，历史记录保留。
 
-拟议 core 模块（不创建空壳层级）：media/hardware/process（S01）；benchmark 标准记录及执行（S02）；predict（S03）；budget（S04）；decision（S05）；pipeline（S06）；dataset（S07）。平台专属 Windows 进程管理和硬件接口放在明确的平台边界。GUI 在 S08 接入公开 core API，不直接依赖编码器。GUI 只消费不可变进度快照和提交请求。
+数据契约：MediaInfo 保留原始媒体属性；JobRequest 使用 u64 字节预算；Decision 选择兼容硬件路线，失败明确报告。队列提供稳定 ID 与不可变快照，生产流水线不依赖 GUI，保留双任务并行、封装容量硬上限与超限重试、分辨率及 HDR 策略。无预测或额外试编码。
 
-数据契约拟议：MediaInfo 包含路径（PathBuf）、时长、宽高、精确有理帧率、编码格式、位深、HDR 类型及颜色标签；未知属性用 Option；JobRequest 包含容量 u64 bytes、输出编码、最大分辨率；Estimate 包含可选耗时/容量、置信度与证据 ID；Decision 包含路线及原因码；BenchmarkRecord 包含 schema 版本、素材哈希、CPU/GPU/驱动、编码器/版本/预设、输入属性、帧数、实际耗时/容量及有版本的实测质量指标。实际类型在对应阶段落实；不提前冻结未验证接口。UI 容量单位与批量每文件/合计规则待明确。
+便携布局：dotorca.exe、tools/、config/、output/、logs/、work/；以 EXE 目录为基准。语言和详情窗口位置大小保存在 config/；旧 data/ 不再读取或写入，不主动删除用户文件。
 
-便携布局：dotOrcA.exe、tools/、config/、data/official/、data/local/、logs/、work/；以 EXE 目录为基准。官方和本地数据独立版本与更新。用户配置、输出和临时文件分离。大文件用流式处理，不整片载入内存。
-
-GUI：CUI v1.5.0 静态 C 库，MSVC static CRT，C ABI bridge 负责组件绘制及事件，Rust 主导任务状态；CPU renderer 强制使用，空闲按事件唤醒。可能仍导入系统 opengl32.dll（上游同时编译两种 renderer）；不等于创建 OpenGL 上下文。中文字体使用系统 fallback，不分发字体文件；首次加载成本需记录。长期维护风险：上游年轻、缺完整 accessibility，混合 DPI/Unicode 路径仍需实际验证；取消中文 IME 专项验收。锁定版本，更新需独立回归。
+GUI：CUI v1.5.0 固定上游 commit，MSVC static CRT，软件渲染。主窗口与独立详情窗口均在 UI 线程以各自 CUI 上下文处理，不嵌套模态循环；一个详情窗口可切换任务，通过稳定 ID 获取最新快照，任务移除或主窗口退出时销毁。五个只读分区支持选择、复制、滚动，错误和标题高亮。C ABI 传递 UTF-8；中文使用系统字体 fallback，不分发字体。默认随系统语言，用户可切换并记忆设置。原始 FFmpeg 诊断保留原文。混合 DPI 和无 CJK 字体环境仍需实机验证。

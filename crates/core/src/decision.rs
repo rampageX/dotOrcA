@@ -2,10 +2,8 @@
 use crate::{
     budget::{self, Codec, Plan},
     hardware::{self, Evidence},
-    media::{Hdr, Rational},
+    media::Hdr,
 };
-
-const MAX_SOFTWARE_TIME_US: u64 = 180_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -54,17 +52,6 @@ pub enum Reason {
     RequestRejected,
     ExecutionFailed,
     ConflictingRouteEvidence,
-    EtaUnknown,
-    EtaUntrusted,
-    EtaTooLong,
-    SpeedUnknown,
-    SpeedUntrusted,
-    SpeedBelowRealtime,
-    BenefitUnknown,
-    BenefitUntrusted,
-    BenefitNotPositive,
-    SoftwareRequestUnverified,
-    HardwareComparatorUnverified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,40 +105,6 @@ pub struct RequestCheck<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    CalibratedProduction,
-    S03Reference,
-    S03ShortWindow,
-    S02Synthetic,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Observation<'a, T> {
-    pub origin: Origin,
-    pub evidence_id: &'a str,
-    pub value: T,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Benefit {
-    /// Positive basis points of quality gain at matched actual capacity.
-    QualityGainBps(i64),
-    /// Positive basis points of capacity saving at matched quality.
-    CapacitySavingBps(i64),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct SoftwareEvidence<'a> {
-    pub job: Job<'a>,
-    pub compared_with: Route,
-    /// Conservative upper bound for the whole task in microseconds.
-    pub eta_upper_us: Option<Observation<'a, u64>>,
-    /// Conservative lower bound on speed relative to source playback.
-    pub speed_lower: Option<Observation<'a, Rational>>,
-    pub benefit: Option<Observation<'a, Benefit>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FallbackReason {
     HardwareUnavailable,
     HardwareExecutionFailed,
@@ -160,7 +113,6 @@ pub enum FallbackReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     DefaultHardware(Route),
-    ProactiveSoftware,
     SoftwareFallback(FallbackReason),
     NoRoute,
 }
@@ -172,15 +124,13 @@ pub struct Decision<'a> {
     pub candidates: Vec<Candidate<'a>>,
     pub constraints: Vec<Reason>,
     pub unknowns: Vec<Reason>,
-    pub proactive_denials: Vec<Reason>,
-    pub software_evidence: Option<SoftwareEvidence<'a>>,
 }
 
 impl Decision<'_> {
     pub fn ready_route(&self) -> Option<Route> {
         let route = match self.selection {
             Selection::DefaultHardware(route) => route,
-            Selection::ProactiveSoftware | Selection::SoftwareFallback(_) => Route::Software,
+            Selection::SoftwareFallback(_) => Route::Software,
             Selection::NoRoute => return None,
         };
         self.candidates
@@ -248,83 +198,12 @@ fn candidate<'a>(job: Job<'a>, route: Route, checks: &[RequestCheck<'a>]) -> Can
     }
 }
 
-fn gate<T>(
-    observation: Option<Observation<'_, T>>,
-    applicable: bool,
-    evaluate: impl FnOnce(T) -> Option<Reason>,
-    unknown: Reason,
-    untrusted: Reason,
-) -> Option<Reason> {
-    match observation {
-        None => Some(unknown),
-        Some(o)
-            if !applicable
-                || o.origin != Origin::CalibratedProduction
-                || o.evidence_id.trim().is_empty() =>
-        {
-            Some(untrusted)
-        }
-        Some(o) => evaluate(o.value),
-    }
-}
-
-fn software_denials(
-    job: Job<'_>,
-    hardware: Option<Route>,
-    evidence: Option<SoftwareEvidence<'_>>,
-) -> Vec<Reason> {
-    let scoped = evidence.is_some_and(|e| job.matches(e.job));
-    let comparison = scoped && evidence.is_some_and(|e| Some(e.compared_with) == hardware);
-    [
-        gate(
-            evidence.and_then(|e| e.eta_upper_us),
-            scoped,
-            |us| match us {
-                0 => Some(Reason::EtaUntrusted),
-                us if us > MAX_SOFTWARE_TIME_US => Some(Reason::EtaTooLong),
-                _ => None,
-            },
-            Reason::EtaUnknown,
-            Reason::EtaUntrusted,
-        ),
-        gate(
-            evidence.and_then(|e| e.speed_lower),
-            scoped,
-            |r| {
-                if r.denominator == 0 {
-                    Some(Reason::SpeedUntrusted)
-                } else if r.numerator < r.denominator {
-                    Some(Reason::SpeedBelowRealtime)
-                } else {
-                    None
-                }
-            },
-            Reason::SpeedUnknown,
-            Reason::SpeedUntrusted,
-        ),
-        gate(
-            evidence.and_then(|e| e.benefit),
-            comparison,
-            |benefit| {
-                let (Benefit::QualityGainBps(gain) | Benefit::CapacitySavingBps(gain)) = benefit;
-                (gain <= 0).then_some(Reason::BenefitNotPositive)
-            },
-            Reason::BenefitUnknown,
-            Reason::BenefitUntrusted,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
 /// Pending candidates require request preflight. A pending selection is an
 /// ordering decision and never authorizes execution or a preservation claim.
 pub fn decide<'a>(
     budget: Result<&'a Plan<'a>, budget::Error>,
     hardware: &'a hardware::Report,
     checks: &[RequestCheck<'a>],
-    evidence: Option<SoftwareEvidence<'a>>,
 ) -> Result<Decision<'a>, budget::Error> {
     let plan = budget?;
     let job = Job { plan, hardware };
@@ -393,37 +272,11 @@ pub fn decide<'a>(
             (Capability::Pending, true) => 1,
             _ => 2,
         });
-    let comparator = hw
-        .filter(|c| c.capability == Capability::Ready)
-        .map(|c| c.route);
-    let mut proactive_denials = software_denials(job, comparator, evidence);
-    // CPU-only CI can explicitly exercise software encoding and publication.
+    // CPU-only CI explicitly enables software encoding for fixture tests.
     let allow_fallback = false;
     #[cfg(test)]
     let allow_fallback = allow_fallback || FIXTURE_FALLBACK.get();
-    if software.capability != Capability::Ready {
-        proactive_denials.push(Reason::SoftwareRequestUnverified);
-    }
-    if comparator.is_none() {
-        proactive_denials.push(Reason::HardwareComparatorUnverified);
-    }
-    if unknowns.contains(&Reason::IncompleteFingerprint) {
-        proactive_denials.push(Reason::IncompleteFingerprint);
-    }
-    for reason in [
-        Reason::EtaUnknown,
-        Reason::SpeedUnknown,
-        Reason::BenefitUnknown,
-    ] {
-        if proactive_denials.contains(&reason) {
-            unknowns.push(reason);
-        }
-    }
-
     let selection = match hw {
-        Some(_) if software.capability == Capability::Ready && proactive_denials.is_empty() => {
-            Selection::ProactiveSoftware
-        }
         Some(hardware) => Selection::DefaultHardware(hardware.route),
         None if software.capability != Capability::Unavailable && allow_fallback => {
             let reason = if hardware_candidates
@@ -444,8 +297,6 @@ pub fn decide<'a>(
         candidates,
         constraints,
         unknowns,
-        proactive_denials,
-        software_evidence: evidence,
     })
 }
 

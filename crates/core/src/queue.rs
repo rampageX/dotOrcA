@@ -1,7 +1,8 @@
 //! Serial production queue shared by portable front ends.
 use crate::{
     budget::Codec,
-    dataset::Store,
+    text::{self, Msg},
+    message,
     decision::Selection,
     hardware::Detector,
     pipeline::{self, EncodeRequest, Event},
@@ -38,20 +39,20 @@ impl Settings {
         let limit_bytes = mib
             .checked_mul(1_048_576)
             .filter(|&bytes| bytes != 0)
-            .ok_or("Enter a positive whole number of MiB within range.")?;
+            .ok_or(text::en(Msg::PositiveMiB))?;
         Self::with_target(Target::Bytes(limit_bytes), codec, max_long_edge)
     }
 
     pub fn percentage(percent: u64, codec: Codec, max_long_edge: u32) -> Result<Self, &'static str> {
         if !(1..=100).contains(&percent) {
-            return Err("Enter a whole percentage from 1 to 100.");
+            return Err(text::en(Msg::PercentRange));
         }
         Self::with_target(Target::Percent(percent as u8), codec, max_long_edge)
     }
 
     fn with_target(target: Target, codec: Codec, max_long_edge: u32) -> Result<Self, &'static str> {
         if max_long_edge < 2 {
-            return Err("Invalid maximum resolution.");
+            return Err(text::en(Msg::InvalidResolution));
         }
         Ok(Self { target, codec, max_long_edge })
     }
@@ -109,8 +110,6 @@ pub struct Job {
     pub phase: Phase,
     pub encoder: Option<&'static str>,
     pub progress_percent: Option<u8>,
-    pub estimated_bytes: Option<u64>,
-    pub eta: Option<pipeline::eta::Estimate>,
     pub output: Option<PathBuf>,
     pub bytes: Option<u64>,
     pub elapsed: Option<Duration>,
@@ -138,8 +137,6 @@ impl Job {
             phase: Phase::Waiting,
             encoder: None,
             progress_percent: None,
-            estimated_bytes: None,
-            eta: None,
             output: None,
             bytes: None,
             elapsed: None,
@@ -226,7 +223,7 @@ impl Queue {
                         if !entry.view.phase.finished() {
                             let job = Arc::make_mut(&mut entry.view);
                             job.phase = Phase::Failed;
-                            job.detail.push("Queue worker stopped unexpectedly.".into());
+                            job.detail.push(text::en(Msg::WorkerStopped).into());
                         }
                     }
                 }
@@ -246,22 +243,22 @@ impl Queue {
 
     pub fn add(&self, source: &Path) -> Result<u32, &'static str> {
         if !source.is_absolute() || source.file_stem().is_none() {
-            return Err("Drop an absolute file path.");
+            return Err(text::en(Msg::AbsolutePath));
         }
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing {
-            return Err("Queue worker is unavailable.");
+            return Err(text::en(Msg::WorkerUnavailable));
         }
         if state.clearing {
-            return Err("Wait for the active task to stop before adding files.");
+            return Err(text::en(Msg::WaitStop));
         }
         if state.entries.len() >= CAPACITY {
-            return Err("Queue is full. Clear finished jobs to add more.");
+            return Err(text::en(Msg::QueueFull));
         }
         state.next = state
             .next
             .checked_add(1)
-            .ok_or("Queue ID range exhausted.")?;
+            .ok_or(text::en(Msg::IdExhausted))?;
         let id = state.next;
         state.entries.push(Entry {
             view: Arc::new(Job::waiting(id, source)),
@@ -274,10 +271,10 @@ impl Queue {
     pub fn start(&self, settings: Settings) -> Result<(), &'static str> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing {
-            return Err("Queue worker is unavailable.");
+            return Err(text::en(Msg::WorkerUnavailable));
         }
         if state.clearing {
-            return Err("Wait for Clear All to finish.");
+            return Err(text::en(Msg::WaitClear));
         }
         for entry in &mut state.entries {
             if entry.view.phase == Phase::Waiting {
@@ -319,11 +316,11 @@ impl Queue {
     pub fn reset(&self, id: u32) -> Result<(), &'static str> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing || state.clearing {
-            return Err("Queue unavailable during shutdown or Clear All.");
+            return Err(text::en(Msg::QueueUnavailable));
         }
         let index = state.entries.iter().position(|e| e.view.id == id && e.view.phase.finished())
-            .ok_or("Only finished tasks can be reset.")?;
-        let next = state.next.checked_add(1).ok_or("Queue ID range exhausted.")?;
+            .ok_or(text::en(Msg::ResetFinished))?;
+        let next = state.next.checked_add(1).ok_or(text::en(Msg::IdExhausted))?;
         let source = state.entries[index].view.source.clone();
         state.next = next;
         state.entries[index] = Entry {
@@ -411,7 +408,7 @@ fn cancel_entry(entry: &mut Entry) {
     let view = Arc::make_mut(&mut entry.view);
     if matches!(phase, Phase::Waiting | Phase::Ready) {
         view.phase = Phase::Cancelled;
-        view.detail.push("Cancelled before processing.".into());
+        view.detail.push(text::en(Msg::CancelBefore).into());
     } else {
         view.phase = Phase::Cancelling;
     }
@@ -469,7 +466,7 @@ fn work(shared: &Shared, mut run: impl FnMut(&Job, &AtomicBool, &Updates<'_>)) {
                 if entry.view.id == job.id {
                     let view = Arc::make_mut(&mut entry.view);
                     view.phase = Phase::Failed;
-                    view.failure = Some("Queue worker stopped unexpectedly.".into());
+                    view.failure = Some(text::en(Msg::WorkerStopped).into());
                 } else {
                     cancel_entry(entry);
                 }
@@ -504,16 +501,9 @@ fn observe(job: &mut Job, event: Event<'_>) {
         return;
     }
     match event {
-        Event::Source(source) => job.source_info = Some(media_summary(source)),
+        Event::Source(source) => job.source_info = Some(text::media_summary(source)),
         Event::Plan(plan) => {
-            let interlaced = matches!(plan.source.raw["field_order"].as_str(), Some("tt" | "bb" | "tb" | "bt"));
-            job.target_info = Some(format!(
-                "{:?} | {} × {} | {} | {:?} | {} | Video {:.0} kb/s | Audio tracks {}",
-                plan.codec, plan.width, plan.height,
-                plan.source.bit_depth.map_or_else(|| "unknown depth".into(), |n| format!("{n}-bit")),
-                plan.source.hdr, if interlaced { "BWDIF 2× cadence" } else { "Original cadence" },
-                plan.video_bps as f64 / 1000.0, plan.audio_bps.len()
-            ));
+            job.target_info = Some(text::target_summary(plan));
         }
         Event::Decision(decision) => {
             job.phase = Phase::Preflight;
@@ -526,23 +516,19 @@ fn observe(job: &mut Job, event: Event<'_>) {
                     Selection::SoftwareFallback(reason) => {
                         job.encoder =
                             Some(crate::decision::Route::Software.encoder(job.settings.expect("started job").codec));
-                        note(job, format!("Software fallback: {reason:?}"));
-                    }
-                    Selection::ProactiveSoftware => {
-                        job.encoder =
-                            Some(crate::decision::Route::Software.encoder(job.settings.expect("started job").codec));
+                        note(job, message!(SoftwareFallback, format!("{reason:?}")));
                     }
                     Selection::NoRoute => {
                         job.encoder = None;
                         for candidate in &decision.candidates {
                             note(
                                 job,
-                                format!("{}: {:?}", candidate.encoder, candidate.reasons),
+                                message!(RouteReason, candidate.encoder, format!("{:?}", candidate.reasons)),
                             );
                         }
                         note(
                             job,
-                            format!("No compatible route. {:?}", decision.constraints),
+                            message!(NoCompatible, format!("{:?}", decision.constraints)),
                         );
                     }
                 }
@@ -557,7 +543,7 @@ fn observe(job: &mut Job, event: Event<'_>) {
         } => {
             job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
             if result != crate::decision::CheckResult::Compatible {
-                note(job, format!("{} preflight: {detail}", job.encoder.unwrap()));
+                note(job, message!(Preflight, job.encoder.unwrap(), detail));
             }
         }
         Event::Encoding { route, .. } => {
@@ -571,7 +557,7 @@ fn observe(job: &mut Job, event: Event<'_>) {
         }
         Event::RouteFailed { route, detail } => {
             job.encoder_error = Some(detail.to_owned());
-            note(job, format!("{} failed.", route.encoder(job.settings.expect("started job").codec)));
+            note(job, message!(EncoderFailed, route.encoder(job.settings.expect("started job").codec)));
         }
         Event::Oversize {
             measured,
@@ -584,42 +570,10 @@ fn observe(job: &mut Job, event: Event<'_>) {
             }
             note(
                 job,
-                format!(
-                    "Output exceeded limit ({measured} bytes). Retry bitrate: {next_video_bps:?}"
-                ),
+                message!(Oversize, measured, format!("{next_video_bps:?}")),
             );
         }
     }
-}
-
-fn media_summary(info: &crate::media::MediaInfo) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!("Container: {} | Duration: {}",
-        info.format.as_deref().unwrap_or("unknown"),
-        info.duration_us.map_or_else(|| "unknown".into(), |n| format!("{:.2} s", n as f64 / 1_000_000.0))));
-    for s in &info.streams {
-        let codec = s.codec.as_deref().unwrap_or("unknown");
-        match s.kind.as_deref() {
-            Some("video") if !s.attached_picture => {
-                let fps = s.avg_rate.map_or_else(|| "unknown fps".into(), |r| format!("{:.3} fps (average)", r.numerator as f64 / r.denominator as f64));
-                lines.push(format!("Video: {codec} | {} × {} | {} | {fps} | {:?} | {}",
-                    s.width.map_or_else(|| "?".into(), |n| n.to_string()),
-                    s.height.map_or_else(|| "?".into(), |n| n.to_string()),
-                    s.bit_depth.map_or_else(|| "unknown depth".into(), |n| format!("{n}-bit")),
-                    s.hdr, s.pixel_format.as_deref().unwrap_or("unknown pixel format")));
-                lines.push(format!("Color: {} / {} / {} / {} | Field order: {}",
-                    s.color_primaries.as_deref().unwrap_or("unknown"), s.color_transfer.as_deref().unwrap_or("unknown"),
-                    s.color_space.as_deref().unwrap_or("unknown"), s.color_range.as_deref().unwrap_or("unknown"),
-                    s.raw["field_order"].as_str().unwrap_or("unknown")));
-            }
-            Some("audio") => lines.push(format!("Audio: {codec} | {} channels | {} Hz",
-                s.channels.map_or_else(|| "?".into(), |n| n.to_string()),
-                s.sample_rate.map_or_else(|| "?".into(), |n| n.to_string()))),
-            Some("subtitle") => lines.push(format!("Subtitle: {codec}")),
-            _ => {}
-        }
-    }
-    lines.join("\n")
 }
 
 // Naming uses the settings frozen at Start, not the actual encoded size.
@@ -653,7 +607,7 @@ fn encode(
         // may have changed since its background size was displayed.
         let meta = fs::metadata(&job.source).map_err(pipeline::Error::Io)?;
         if !meta.is_file() || meta.len() == 0 {
-            return Err(pipeline::Error::UnsupportedMedia("Source must be a nonempty file."));
+            return Err(pipeline::Error::UnsupportedMedia(text::en(Msg::SourceEmpty)));
         }
         if cancel.load(Ordering::Acquire) {
             return Err(pipeline::Error::Cancelled);
@@ -668,20 +622,17 @@ fn encode(
         });
         if source_bytes <= limit {
             // Size is the primary goal, regardless of requested codec/edge.
-            // Do not create a duplicate, invoke FFmpeg, or write learning data.
+            // Do not create a duplicate or invoke FFmpeg.
             return Ok(None);
         }
         if limit == 0 {
-            return Err(pipeline::Error::UnsupportedMedia("Target rounds down to zero bytes."));
+            return Err(pipeline::Error::UnsupportedMedia(text::en(Msg::ZeroLimit)));
         }
         let dir = root.join("output");
         fs::create_dir_all(&dir).map_err(|e| {
             pipeline::Error::Io(io::Error::new(
                 e.kind(),
-                format!(
-                    "Cannot create portable output folder {}: {e}",
-                    dir.display()
-                ),
+                message!(MakeOutput, dir.display(), e),
             ))
         })?;
         let destination = output_path(&dir, &job.source, settings);
@@ -703,7 +654,7 @@ fn encode(
             if !path.is_file() {
                 return Err(pipeline::Error::Io(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("Missing encoding tool {}", path.display()),
+                    message!(MissingTool, path.display()),
                 )));
             }
         }
@@ -721,19 +672,12 @@ fn encode(
         let report = |percent| { update.modify(|job| {
             if job.phase == Phase::Encoding { job.progress_percent = Some(percent); }
         }); };
-        let parallel = update.shared.state.lock().unwrap_or_else(|e| e.into_inner()).parallelism > 1;
-        let publication = if parallel {
-            let output = pipeline::encode_with_progress(&request, detector, cancel, observer, Some(&report))?;
-            pipeline::TrackedPublication { output, learning: Ok(()) }
-        } else {
-            let store = Store::portable(root).map_err(pipeline::Error::Io)?;
-            pipeline::encode_and_learn_with_progress(&request, detector, cancel, observer, &store, Some(&report))?
-        };
+        let publication = pipeline::encode_with_progress(&request, detector, cancel, observer, Some(&report))?;
         // One metadata-only read of the saved container, never a frame scan.
         // This is presentation only and cannot turn a saved output into failure.
-        match crate::media::probe(&ffprobe, &publication.output.path, cancel) {
-            Ok(info) => { update.modify(|job| job.output_info = Some(media_summary(&info))); }
-            Err(error) => { update.modify(|job| note(job, format!("Output metadata unavailable: {error}"))); }
+        match crate::media::probe(&ffprobe, &publication.path, cancel) {
+            Ok(info) => { update.modify(|job| job.output_info = Some(text::media_summary(&info))); }
+            Err(error) => { update.modify(|job| note(job, message!(OutputMetadata,error))); }
         }
         Ok(Some(publication))
     })();
@@ -744,65 +688,56 @@ fn encode(
             Ok(None) => {
                 if cancel.load(Ordering::Acquire) {
                     job.phase = Phase::Cancelled;
-                    note(job, "Cancelled during processing.".into());
+                    note(job, text::en(Msg::CancelDuring).into());
                 } else {
                     job.phase = Phase::Skipped;
-                    job.skip_reason = Some("Source already within target capacity");
-                    note(job, "Source already within target capacity. Original retained; no output created.".into());
+                    job.skip_reason = Some(text::en(Msg::SourceWithin));
+                    note(job, text::en(Msg::SourceRetained).into());
                 }
             }
-            Ok(Some(publication)) => {
-                let out = publication.output;
+            Ok(Some(out)) => {
                 job.phase = Phase::Published;
                 job.output = Some(out.path);
                 job.bytes = Some(out.bytes);
                 job.elapsed = Some(out.elapsed);
-                job.eta = out.production_eta;
                 job.selection = Some(out.selection);
                 job.encoder = Some(out.route.encoder(job.settings.expect("started job").codec));
-                if let Err(error) = publication.learning {
-                    note(
-                        job,
-                        format!("Output saved. Local learning write failed: {error}"),
-                    );
-                }
             }
             Err(pipeline::Error::DestinationExists) => {
                 if cancel.load(Ordering::Acquire) {
                     job.phase = Phase::Cancelled;
-                    note(job, "Cancelled during processing.".into());
+                    note(job, text::en(Msg::CancelDuring).into());
                 } else {
                     job.phase = Phase::Skipped;
-                    job.skip_reason = Some("Target file already exists");
-                    note(job, "Target file already exists. Existing output retained; no overwrite.".into());
+                    job.skip_reason = Some(text::en(Msg::Exists));
+                    note(job, text::en(Msg::ExistsRetained).into());
                 }
             }
             Err(pipeline::Error::Cancelled) => {
                 job.phase = Phase::Cancelled;
-                note(job, "Cancelled during processing.".into());
+                note(job, text::en(Msg::CancelDuring).into());
             }
             Err(error) => {
                 job.phase = Phase::Failed;
                 let detail = match error {
                     pipeline::Error::Process(detail) => {
                         job.encoder_error = Some(detail);
-                        "FFmpeg/process failed".into()
+                        text::en(Msg::ProcessFailed).into()
                     }
-                    pipeline::Error::HardwareRouteUnavailable => "No compatible hardware route. See the preflight or encoding failure details.".into(),
+                    pipeline::Error::HardwareRouteUnavailable => text::en(Msg::HardwareUnavailable).into(),
                     pipeline::Error::Io(error)
                         if error.kind() == io::ErrorKind::PermissionDenied =>
                     {
-                        format!("Access denied. Check portable output write permission and input access: {error}")
+                        message!(AccessDenied,error)
                     }
-                    pipeline::Error::Io(error) => error.to_string(),
-                    other => format!("{other:?}"),
+                    other => text::pipeline_error(other),
                 };
                 job.failure = Some(detail.clone());
                 note(job, detail);
             }
         }
         if let Err(error) = write_log(root, job) {
-            note(job, format!("Portable log write failed: {error}"));
+            note(job, message!(LogFailed,error));
         }
         update.modify(|job| {
             // The size reader may have completed while the terminal log was
@@ -1009,7 +944,7 @@ mod tests {
         assert_eq!(jobs[0].target_bytes, Some(50));
         assert_eq!(jobs[0].phase, Phase::Failed);
         assert!(fs::read_dir(root.join("output")).unwrap().next().is_none());
-        assert!(!root.join("data/local/production-v1.json").exists());
+        assert!(!root.join("data").exists());
         queue.shutdown();
         assert_eq!(fs::metadata(&path).unwrap().len(), 100);
         fs::remove_dir_all(root).unwrap();
@@ -1230,7 +1165,6 @@ mod tests {
                 .len(),
             bytes
         );
-        assert!(jobs[0].eta.is_none());
         assert_eq!(jobs[1].phase, Phase::Skipped);
         assert_eq!(jobs[1].skip_reason, Some("Target file already exists"));
         assert!(jobs[1].destination.is_some());
@@ -1241,7 +1175,7 @@ mod tests {
         assert_eq!(jobs[3].phase, Phase::Cancelled);
         assert!(source.exists());
         assert!(
-            root.join("data/local/production-v1.json").is_file(),
+            !root.join("data").exists(),
             "{:?}",
             jobs[0]
         );

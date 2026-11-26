@@ -1,7 +1,5 @@
 //! S04 per-output policy. No encoder or filesystem side effects.
 use crate::media::{MediaInfo, Rational, Stream};
-use crate::predict::Database;
-use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec { H264, Hevc, Av1 }
@@ -92,33 +90,6 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
         source_rate: rate, source })
 }
 
-#[derive(Debug)]
-pub struct FixturePoint<'a> {
-    pub case_id: &'a str,
-    pub nominal_bps: u64,
-    pub actual_container_bps: f64,
-    pub ssim: f64,
-    pub psnr_db: &'a Value,
-}
-
-/// Historical observations only. Report pins machine, tools and environment;
-/// decoded hash pins fixture. Filter by actual container bytes at its 6s duration.
-/// Return non-dominated points on actual bytes and SSIM; ties retained.
-pub fn fixture_frontier<'a>(db: &'a Database, report: &str, decoded: &str, codec: Codec, limit: u64) -> Vec<FixturePoint<'a>> {
-    let name = match codec { Codec::H264 => "h264", Codec::Hevc => "hevc", Codec::Av1 => "av1" };
-    let rows: Vec<_> = db.reference_cases().filter(|(d,f,r)| {
-        d["source_report_sha256"] == report && f["decoded_sha256"] == decoded &&
-        r["codec"] == name && r["output_bytes"].as_u64().is_some_and(|n| n <= limit)
-    }).map(|(_,_,r)| r).collect();
-    rows.iter().filter(|r| !rows.iter().any(|other| {
-        let (a,b) = (other["output_bytes"].as_u64(),r["output_bytes"].as_u64());
-        let (q,p) = (other["ssim"].as_f64(),r["ssim"].as_f64());
-        a <= b && q >= p && (a < b || q > p)
-    })).filter_map(|r| Some(FixturePoint { case_id:r["case_id"].as_str()?,
-        nominal_bps:r["target_bitrate_bps"].as_u64()?, actual_container_bps:r["actual_container_bitrate_bps"].as_f64()?,
-        ssim:r["ssim"].as_f64()?, psnr_db:&r["psnr_db"] })).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,17 +166,4 @@ mod tests {
         assert_eq!((p.width,p.height),(1071,1920));
     }
 
-    #[test]
-    fn historical_budget_boundary() {
-        let db=Database::bundled().unwrap();
-        let (d,f,r)=db.reference_cases().find(|(_,_,r)| r["codec"]=="h264").unwrap();
-        let report=d["source_report_sha256"].as_str().unwrap();
-        let hash=f["decoded_sha256"].as_str().unwrap();
-        let bytes=r["output_bytes"].as_u64().unwrap();
-        let points=fixture_frontier(&db,report,hash,Codec::H264,bytes);
-        assert!(!points.is_empty());
-        assert!(points.iter().all(|p|p.actual_container_bps <= bytes as f64*8.0/6.0+0.001));
-        assert!(fixture_frontier(&db,report,hash,Codec::H264,0).is_empty());
-        assert!(fixture_frontier(&db,report,"real movie",Codec::H264,u64::MAX).is_empty());
-    }
 }

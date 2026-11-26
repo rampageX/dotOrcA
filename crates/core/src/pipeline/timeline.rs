@@ -13,7 +13,7 @@ impl Clock {
             .and_then(|s| s.split_once('/'))
             .and_then(|(n, d)| n.parse::<u64>().ok().zip(d.parse::<u64>().ok()))
             .filter(|(n, d)| *n > 0 && *d > 0)
-            .ok_or(Error::UnsupportedMedia("missing stream time base"))?;
+            .ok_or(Error::UnsupportedMedia(crate::text::en(crate::text::Msg::NoTimeBase)))?;
         Ok(Self { den })
     }
 

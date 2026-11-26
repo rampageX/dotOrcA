@@ -95,47 +95,12 @@ fn production_special_path_vfr_audio_and_hdr() {
         Event::Decision(_) => {}
         _ => eprintln!("{e:?}"),
     };
-    let learning_root = test_root();
-    let store = Store::portable(&learning_root.0).unwrap();
-    let mut retries = 0;
-    let tracked = encode_and_learn(
-        &request,
-        &mut detector,
-        &cancel,
-        |event| {
-            if matches!(
-                event,
-                Event::Oversize {
-                    next_video_bps: Some(_),
-                    ..
-                }
-            ) {
-                retries += 1;
-            }
-            logs(event);
-        },
-        &store,
-    )
-    .unwrap();
-    tracked.learning.unwrap();
-    let first = tracked.output;
-    let local = learning_root.0.join("data/local/production-v1.json");
-    let history = fs::read(&local).unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&history).unwrap();
-    assert_eq!(json["records"].as_array().unwrap().len(), 1);
-    assert_eq!(json["records"][0]["bytes"], first.bytes);
-    assert_eq!(json["records"][0]["capacity_retries"], retries);
-    assert_eq!(
-        json["records"][0]["profile"]["encoder"],
-        first.route.encoder(request.codec)
-    );
-    assert_eq!(json["records"][0]["source"], "s09-ffmpeg-publication-v1");
-    assert!(!String::from_utf8_lossy(&history).contains("鹅腿坟场"));
+    let first = encode(&request, &mut detector, &cancel, logs).unwrap();
     assert!(first.bytes <= request.limit_bytes && first.bytes > 0);
     let cancel_out = root.0.join("cancelled.mp4");
     request.destination = &cancel_out;
     assert!(matches!(
-        encode_and_learn(
+        encode(
             &request,
             &mut detector,
             &cancel,
@@ -144,7 +109,6 @@ fn production_special_path_vfr_audio_and_hdr() {
                     cancel.store(true, Ordering::Release);
                 }
             },
-            &store
         ),
         Err(Error::Cancelled)
     ));
@@ -153,7 +117,7 @@ fn production_special_path_vfr_audio_and_hdr() {
     request.destination = &destination;
     let existing = fs::read(&destination).unwrap();
     assert!(matches!(
-        encode_and_learn(&request, &mut detector, &cancel, |_| {}, &store),
+        encode(&request, &mut detector, &cancel, |_| {}),
         Err(Error::DestinationExists)
     ));
     request.destination = &source;
@@ -162,18 +126,6 @@ fn production_special_path_vfr_audio_and_hdr() {
         Err(Error::InvalidDestination)
     ));
     assert_eq!(fs::read(&destination).unwrap(), existing);
-    assert_eq!(fs::read(local).unwrap(), history);
-
-    let blocked = learning_root.0.join("unwritable-store");
-    fs::create_dir(&blocked).unwrap();
-    fs::write(blocked.join("data"), b"not a directory").unwrap();
-    let store = Store::portable(&blocked).unwrap();
-    let untracked = learning_root.0.join("published with storage failure.mp4");
-    request.destination = &untracked;
-    let result = encode_and_learn(&request, &mut detector, &cancel, |_| {}, &store).unwrap();
-    assert!(result.learning.is_err());
-    assert_eq!(fs::metadata(&untracked).unwrap().len(), result.output.bytes);
-
     let hdr = root.0.join("HDR 🎬 & ( ) ^ % !.mp4");
     let hdr_out = root.0.join("HLG output.mp4");
     run_fixture(
@@ -219,7 +171,7 @@ fn production_special_path_vfr_audio_and_hdr() {
     request.destination = &hdr_out;
     request.codec = Codec::Hevc;
     let first = encode(&request, &mut detector, &cancel, logs).unwrap();
-    assert!(first.bytes <= request.limit_bytes && first.production_eta.is_none());
+    assert!(first.bytes <= request.limit_bytes);
     request.destination = &hdr;
     assert!(matches!(
         encode(&request, &mut detector, &cancel, |_| {}),

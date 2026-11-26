@@ -1,7 +1,6 @@
 //! S06 encoding, validation and no-clobber publication.
 use crate::{
     budget::{self, Codec, Plan},
-    dataset::{Fingerprint, Observation, Outcome, Profile, Store},
     decision::{self, CheckResult, Decision, Route, Selection},
     hardware::Detector,
     media::{self, Hdr, MediaInfo},
@@ -15,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub mod eta;
 mod timeline;
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -87,7 +85,6 @@ pub struct Published {
     pub selection: Selection,
     pub video_bps: u64,
     pub elapsed: Duration,
-    pub production_eta: Option<eta::Estimate>,
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), Error> {
@@ -449,11 +446,10 @@ pub fn encode(
     cancel: &AtomicBool,
     observe: impl FnMut(Event<'_>),
 ) -> Result<Published, Error> {
-    encode_inner(request, detector, cancel, observe, None, None)
+    encode_inner(request, detector, cancel, observe, None)
 }
 
-/// GUI parallel mode uses the same production path without mixing
-/// concurrent timings into the serial learning dataset.
+/// Reports measured progress in the current encoding pass.
 pub fn encode_with_progress(
     request: &EncodeRequest<'_>,
     detector: &mut Detector,
@@ -461,49 +457,7 @@ pub fn encode_with_progress(
     observe: impl FnMut(Event<'_>),
     progress: Option<&(dyn Fn(u8) + Sync)>,
 ) -> Result<Published, Error> {
-    encode_inner(request, detector, cancel, observe, None, progress)
-}
-
-#[derive(Debug)]
-pub struct TrackedPublication {
-    pub output: Published,
-    pub learning: io::Result<()>,
-}
-
-/// Runs the S06 pipeline and records only a verified, successfully
-/// published result. A storage failure leaves the output successful.
-pub fn encode_and_learn(
-    request: &EncodeRequest<'_>,
-    detector: &mut Detector,
-    cancel: &AtomicBool,
-    observe: impl FnMut(Event<'_>),
-    store: &Store,
-) -> Result<TrackedPublication, Error> {
-    encode_and_learn_with_progress(request, detector, cancel, observe, store, None)
-}
-
-/// Reports measured frame completion within the current encode attempt.
-/// The callback runs on the stdout reader and must return promptly.
-pub fn encode_and_learn_with_progress(
-    request: &EncodeRequest<'_>,
-    detector: &mut Detector,
-    cancel: &AtomicBool,
-    observe: impl FnMut(Event<'_>),
-    store: &Store,
-    progress: Option<&(dyn Fn(u8) + Sync)>,
-) -> Result<TrackedPublication, Error> {
-    check_cancel(cancel)?;
-    let fingerprint = Fingerprint::read(request.ffmpeg, request.ffprobe);
-    let mut observation = None;
-    let tracking = fingerprint.as_ref().ok().map(|id| (id, &mut observation));
-    let output = encode_inner(request, detector, cancel, observe, tracking, progress)?;
-    let learning = fingerprint.and_then(|before| {
-        if before != Fingerprint::read(request.ffmpeg, request.ffprobe)? {
-            return Err(io::Error::other("encoding tools changed during production"));
-        }
-        store.record(observation.expect("tracked publication creates a production observation"))
-    });
-    Ok(TrackedPublication { output, learning })
+    encode_inner(request, detector, cancel, observe, progress)
 }
 
 fn encode_inner(
@@ -511,7 +465,6 @@ fn encode_inner(
     detector: &mut Detector,
     cancel: &AtomicBool,
     mut observe: impl FnMut(Event<'_>),
-    tracking: Option<(&Fingerprint, &mut Option<Observation>)>,
     progress: Option<&(dyn Fn(u8) + Sync)>,
 ) -> Result<Published, Error> {
     let start = Instant::now();
@@ -562,7 +515,7 @@ fn encode_inner(
     }
     if clock.den > i32::MAX as u64 {
         return Err(Error::UnsupportedMedia(
-            "video time base exceeds MP4 timescale",
+            crate::text::en(crate::text::Msg::TimeBaseLarge),
         ));
     }
     #[cfg(not(test))]
@@ -574,7 +527,7 @@ fn encode_inner(
         detector.list_for_transcode(request.ffmpeg, cancel)
     };
     let hardware = hardware.map_err(|e| io_error(e, cancel))?;
-    let decision = decision::decide(Ok(&plan), &hardware, &[], None).map_err(Error::Budget)?;
+    let decision = decision::decide(Ok(&plan), &hardware, &[]).map_err(Error::Budget)?;
     observe(Event::Decision(&decision));
     let route = match decision.selection {
         Selection::DefaultHardware(route) => route,
@@ -594,7 +547,6 @@ fn encode_inner(
             route,
             video_bps: rate,
         });
-        let attempt_start = Instant::now();
         let mut command = encode_command(
             request, &source, &plan, clock, interlaced, route, rate, &output,
         );
@@ -614,40 +566,17 @@ fn encode_inner(
             observe(Event::RouteFailed { route, detail });
         }
         result?;
-        let encode_elapsed = attempt_start.elapsed();
         observe(Event::Validating);
         let bytes = fs::metadata(&output)
             .map_err(|e| io_error(e, cancel))?
             .len();
         if bytes == 0 {
-            return Err(Error::Process("FFmpeg produced an empty file".into()));
+            return Err(Error::Process(crate::text::en(crate::text::Msg::EmptyOutput).into()));
         }
         if budget::fits(plan.limit_bytes, Some(bytes)) {
             unchanged(&source.path, &source_meta, cancel)?;
             publish(&output, &destination, cancel)?;
             let elapsed = start.elapsed();
-            if let Some((tools, slot)) = tracking {
-                let profile = Profile::new(
-                    &source,
-                    &plan,
-                    &hardware.inventory,
-                    route,
-                    rate,
-                    tools.clone(),
-                );
-                *slot = Some(Observation::published(
-                    profile,
-                    Outcome {
-                        total: elapsed,
-                        encode: encode_elapsed,
-                        bytes,
-                        retries: reencodes,
-                        failed_preflights: Vec::new(),
-                        failed_encodes: Vec::new(),
-                        selection: decision.selection,
-                    },
-                ));
-            }
             return Ok(Published {
                 path: destination,
                 bytes,
@@ -655,7 +584,6 @@ fn encode_inner(
                 selection: decision.selection,
                 video_bps: rate,
                 elapsed,
-                production_eta: None,
             });
         }
         let next = (reencodes < MAX_REENCODES)

@@ -80,7 +80,7 @@ const ENCODERS:[(&str,u8);18]=[
 fn checked_text(exe:&Path,args:&[&str],cancel:&AtomicBool)->io::Result<String>{
     let o=process::run(&Request::new(exe).args(args.iter().copied()),cancel)?;
     if o.stop!=Stop::Exited||!o.status.success()||o.stdout.discarded>0{
-        return Err(io::Error::other(format!("tool query {:?}: {}: {}",o.stop,o.status,String::from_utf8_lossy(&o.stderr.bytes))));
+        return Err(io::Error::other(crate::message!(EncodingToolQuery,format!("{:?}",o.stop),o.status,String::from_utf8_lossy(&o.stderr.bytes))));
     }
     String::from_utf8(o.stdout.bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))
 }
@@ -101,7 +101,7 @@ fn try_encoder(exe:&Path,name:&str,bits:u8,cancel:&AtomicBool)->io::Result<Capab
     let mut req=Request::new(exe).args(["-hide_banner","-loglevel","error","-nostdin","-progress","pipe:1","-f","lavfi","-i",&source,"-an","-frames:v","3","-c:v",name,"-pix_fmt",&strict,"-f","null","-"]);
     req.timeout=Duration::from_secs(15);
     let o=process::run(&req,cancel)?;
-    if o.stop==Stop::Cancelled||cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,"hardware detection cancelled"));}
+    if o.stop==Stop::Cancelled||cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,crate::text::en(crate::text::Msg::DetectCancelled)));}
     let evidence=if o.stop==Stop::TimedOut{Evidence::TimedOut}
         else if o.status.success()&&o.stdout.discarded==0&&completed(&String::from_utf8_lossy(&o.stdout.bytes)){Evidence::Verified}
         else{Evidence::Failed};
@@ -134,9 +134,9 @@ impl Detector{
             });
             let compiled = listed(&listed_encoders, encoder);
             let (evidence, diagnostic) = if !compiled {
-                (Evidence::NotListed, "encoder not compiled into this ffmpeg")
+                (Evidence::NotListed, crate::text::en(crate::text::Msg::HardwareNotListed))
             } else if complete_pci_inventory && !present {
-                (Evidence::AdapterAbsent, "matching PCI display adapter not present")
+                (Evidence::AdapterAbsent, crate::text::en(crate::text::Msg::AdapterAbsent))
             } else {
                 return None;
             };
@@ -148,7 +148,7 @@ impl Detector{
     /// Memory cache only, keyed by present adapters/driver, tool identity and CPU.
     /// Failed/timed-out probes are evidence of this attempt, not permanent unsupported claims.
     pub fn detect(&mut self,exe:&Path,cancel:&AtomicBool)->io::Result<Report>{
-        if !exe.is_absolute(){return Err(io::Error::new(io::ErrorKind::InvalidInput,"absolute ffmpeg path required"));}
+        if !exe.is_absolute(){return Err(io::Error::new(io::ErrorKind::InvalidInput,crate::text::en(crate::text::Msg::AbsoluteFfmpeg)));}
         let exe=std::fs::canonicalize(exe)?;
         let meta=std::fs::metadata(&exe)?;
         let version=checked_text(&exe,&["-version"],cancel)?;
@@ -165,9 +165,9 @@ impl Detector{
         let list=checked_text(&exe,&["-hide_banner","-encoders"],cancel)?;
         let mut capabilities=Vec::new();
         for (name,bits) in ENCODERS {
-            if cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,"hardware detection cancelled"));}
+            if cancel.load(Ordering::Acquire){return Err(io::Error::new(io::ErrorKind::Interrupted,crate::text::en(crate::text::Msg::DetectCancelled)));}
             capabilities.push(if listed(&list,name){try_encoder(&exe,name,bits,cancel)?}
-                else{Capability{encoder:name.into(),bit_depth:bits,evidence:Evidence::NotListed,diagnostic:"encoder not compiled into this ffmpeg".into()}});
+                else{Capability{encoder:name.into(),bit_depth:bits,evidence:Evidence::NotListed,diagnostic:crate::text::en(crate::text::Msg::HardwareNotListed).into()}});
         }
         let report=Report{inventory:inv,tool_version:version,tool:key.tool.clone(),capabilities,cache_hit:false};
         // A transient timeout or initialization failure must not be cached indefinitely.

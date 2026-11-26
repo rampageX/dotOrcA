@@ -48,7 +48,7 @@ mod win {
             let mut tid=None;
             loop {
                 if e.pid==pid {
-                    if tid.replace(e.tid).is_some() { return Err(io::Error::other("multiple threads in suspended process")); }
+                    if tid.replace(e.tid).is_some() { return Err(io::Error::other(crate::text::en(crate::text::Msg::SuspendedThreads))); }
                 }
                 e.size=size_of::<ThreadEntry>() as u32;
                 if Thread32Next(s.0,&mut e)==0 {
@@ -57,12 +57,12 @@ mod win {
                     break;
                 }
             }
-            let t=OpenThread(0x0002|0x0800,0,tid.ok_or_else(||io::Error::other("initial thread not found"))?);
+            let t=OpenThread(0x0002|0x0800,0,tid.ok_or_else(||io::Error::other(crate::text::en(crate::text::Msg::InitialThread)))?);
             if t.is_null() { return Err(last()); }
             let t=Owned(t);
-            if GetProcessIdOfThread(t.0)!=pid { return Err(io::Error::other("initial thread owner mismatch")); }
+            if GetProcessIdOfThread(t.0)!=pid { return Err(io::Error::other(crate::text::en(crate::text::Msg::ThreadOwner))); }
             match ResumeThread(t.0) {
-                1=>Ok(()), u32::MAX=>Err(last()), _=>Err(io::Error::other("unexpected suspend count")),
+                1=>Ok(()), u32::MAX=>Err(last()), _=>Err(io::Error::other(crate::text::en(crate::text::Msg::SuspendCount))),
             }
         }
     }
