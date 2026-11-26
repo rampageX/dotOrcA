@@ -3,3 +3,4 @@
 pub mod media;
 pub mod process;
 pub mod hardware;
+pub mod benchmark;
