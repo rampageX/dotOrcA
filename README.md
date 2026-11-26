@@ -2,7 +2,7 @@
 
 全自动视频压缩器。以目标文件容量为硬约束，在画质与处理时间之间智能决策。
 
-技术栈：Rust + CUI v1.5.0（CPU 软件渲染），Windows x64，便携式单 EXE，外置编码器和数据。核心与 Benchmark 保持纯 Rust；CUI 通过薄 C ABI 桥接。S00 已完成基线验收；下一阶段 S01 尚未实现。仓库只包含工程骨架和已验收 GUI 探针，不是可用的压缩器。
+技术栈：Rust + CUI v1.5.0（CPU 软件渲染），Windows x64，便携式单 EXE，外置编码器和数据。核心与 Benchmark 保持纯 Rust；CUI 通过薄 C ABI 桥接。S08 候选实现已接入生产编码与批量队列，验收状态见 [S08.md](docs/S08.md)。
 
 - [项目章程](docs/CHARTER.md)
 - [总任务卡](docs/ROADMAP.md)

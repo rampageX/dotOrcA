@@ -1,27 +1,34 @@
-#![windows_subsystem = "windows"]
-use orca_probe::Worker;
-use std::{ffi::c_char, sync::OnceLock};
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
-static WORKER: OnceLock<Worker> = OnceLock::new();
+#[cfg(any(windows, test))]
+mod bridge;
 
-#[no_mangle]
-pub extern "C" fn arena_worker_start() {
-    WORKER.get_or_init(Worker::default).start();
+#[cfg(windows)]
+extern "C" {
+    fn orca_cui_run() -> i32;
+    fn orca_cui_self_test() -> i32;
 }
 
-// Returns 1 while an update is needed. A single textual snapshot determines
-// wakeup, so completion between separate loads cannot leave a stale status.
-#[no_mangle]
-pub unsafe extern "C" fn arena_worker_status(out: *mut c_char, capacity: usize) -> i32 {
-    let text = WORKER.get_or_init(Worker::default).text();
-    if out.is_null() || capacity <= text.len() { return 0; }
-    std::ptr::copy_nonoverlapping(text.as_ptr(), out.cast::<u8>(), text.len());
-    *out.add(text.len()) = 0;
-    i32::from(!text.contains("idle") && !text.contains("DONE"))
-}
-
-extern "C" { fn arena_cui_run() -> i32; }
+#[cfg(windows)]
 fn main() {
-    let code = unsafe { arena_cui_run() };
-    if code != 0 { std::process::exit(code); }
+    // SAFETY: the CUI entry points run synchronously on this UI thread.
+    let result = unsafe {
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|arg| arg == "--self-test")
+        {
+            orca_cui_self_test()
+        } else {
+            orca_cui_run()
+        }
+    };
+    bridge::shutdown();
+    if result != 0 {
+        std::process::exit(result);
+    }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("The dotOrcA GUI requires Windows.");
 }

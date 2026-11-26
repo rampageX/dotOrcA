@@ -1,5 +1,8 @@
 use std::{env, path::PathBuf};
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     let dir = PathBuf::from(env::var_os("CUI_LIB_DIR").expect("CUI_LIB_DIR must point to the CMake Release library directory"));
     for lib in ["cui_bridge.lib", "cui.lib"] {
         assert!(dir.join(lib).is_file(), "missing {}", dir.join(lib).display());

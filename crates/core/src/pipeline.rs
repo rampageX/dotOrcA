@@ -9,7 +9,7 @@ use crate::{
 };
 use std::{
     fs::{self, File, Metadata},
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -66,6 +66,7 @@ pub enum Event<'a> {
         route: Route,
         video_bps: u64,
     },
+    Validating,
     RouteFailed {
         route: Route,
         detail: &'a str,
@@ -384,7 +385,15 @@ fn encoder_error(diagnostic: &str, encoder: &str) -> bool {
 }
 
 fn run_encoder(cmd: &Request, encoder: &str, cancel: &AtomicBool) -> Result<(), AttemptError> {
-    let out = process::run(cmd, cancel).map_err(|e| io_error(e, cancel))?;
+    finish_encoder(process::run(cmd, cancel), encoder, cancel)
+}
+
+fn finish_encoder(
+    result: io::Result<process::Outcome>,
+    encoder: &str,
+    cancel: &AtomicBool,
+) -> Result<(), AttemptError> {
+    let out = result.map_err(|e| io_error(e, cancel))?;
     check_cancel(cancel)?;
     if out.stop == Stop::TimedOut {
         return Err(Error::Process(format!("{encoder}: encoding deadline exceeded")).into());
@@ -408,6 +417,40 @@ fn run_encoder(cmd: &Request, encoder: &str, cancel: &AtomicBool) -> Result<(), 
         return Err(AttemptError::Route(detail));
     }
     Err(Error::Process(detail).into())
+}
+
+/// FFmpeg progress records are line oriented. Keep a fixed-size line buffer
+/// and discard long fields while continuing to drain the pipe.
+fn read_progress(mut input: impl Read, total: usize, report: &dyn Fn(u8)) {
+    let mut chunk = [0; 4096];
+    let mut line = [0; 64];
+    let mut len = 0;
+    let mut last = 0;
+    while let Ok(n @ 1..) = input.read(&mut chunk) {
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                if total != 0 && len <= line.len() {
+                    let frame = std::str::from_utf8(&line[..len])
+                        .ok()
+                        .and_then(|s| s.strip_prefix("frame="))
+                        .and_then(|s| s.trim().parse::<usize>().ok());
+                    if let Some(frame) = frame {
+                        let percent = (100 * frame as u128 / total as u128).min(100) as u8;
+                        if percent > last {
+                            last = percent;
+                            report(percent);
+                        }
+                    }
+                }
+                len = 0;
+            } else if len < line.len() {
+                line[len] = byte;
+                len += 1;
+            } else {
+                len = line.len() + 1;
+            }
+        }
+    }
 }
 
 fn display_matrix(stream: &Stream) -> Option<&serde_json::Value> {
@@ -459,7 +502,7 @@ pub fn encode(
     cancel: &AtomicBool,
     observe: impl FnMut(Event<'_>),
 ) -> Result<Published, Error> {
-    encode_inner(request, detector, cancel, observe, None)
+    encode_inner(request, detector, cancel, observe, None, None)
 }
 
 #[derive(Debug)]
@@ -477,11 +520,24 @@ pub fn encode_and_learn(
     observe: impl FnMut(Event<'_>),
     store: &Store,
 ) -> Result<TrackedPublication, Error> {
+    encode_and_learn_with_progress(request, detector, cancel, observe, store, None)
+}
+
+/// Reports measured frame completion within the current encode attempt.
+/// The callback runs on the stdout reader and must return promptly.
+pub fn encode_and_learn_with_progress(
+    request: &EncodeRequest<'_>,
+    detector: &mut Detector,
+    cancel: &AtomicBool,
+    observe: impl FnMut(Event<'_>),
+    store: &Store,
+    progress: Option<&(dyn Fn(u8) + Sync)>,
+) -> Result<TrackedPublication, Error> {
     check_cancel(cancel)?;
     let fingerprint = Fingerprint::read(request.ffmpeg, request.ffprobe);
     let mut observation = None;
     let tracking = fingerprint.as_ref().ok().map(|id| (id, &mut observation));
-    let output = encode_inner(request, detector, cancel, observe, tracking)?;
+    let output = encode_inner(request, detector, cancel, observe, tracking, progress)?;
     let learning = fingerprint.and_then(|before| {
         if before != Fingerprint::read(request.ffmpeg, request.ffprobe)? {
             return Err(io::Error::other("encoding tools changed during production"));
@@ -497,6 +553,7 @@ fn encode_inner(
     cancel: &AtomicBool,
     mut observe: impl FnMut(Event<'_>),
     tracking: Option<(&Fingerprint, &mut Option<Observation>)>,
+    progress: Option<&(dyn Fn(u8) + Sync)>,
 ) -> Result<Published, Error> {
     let start = Instant::now();
     check_cancel(cancel)?;
@@ -575,12 +632,22 @@ fn encode_inner(
             let attempt_start = Instant::now();
             let mut encode_elapsed = Duration::ZERO;
             let result = (|| {
-                run_encoder(
-                    &encode_command(request, &source, &plan, clock, route, rate, false, &output),
-                    route.encoder(plan.codec),
-                    cancel,
-                )?;
+                let mut command =
+                    encode_command(request, &source, &plan, clock, route, rate, false, &output);
+                let encoder = route.encoder(plan.codec);
+                if let Some(report) = progress {
+                    command
+                        .args
+                        .splice(0..0, ["-progress".into(), "pipe:1".into()]);
+                    let result = process::run_with_stdout(&command, cancel, |reader| {
+                        read_progress(reader, original.video_frames(), report);
+                    });
+                    finish_encoder(result.map(|(outcome, ())| outcome), encoder, cancel)?;
+                } else {
+                    run_encoder(&command, encoder, cancel)?;
+                }
                 encode_elapsed = attempt_start.elapsed();
+                observe(Event::Validating);
                 validate(request, &plan, clock, &original, &output, false, cancel)
             })();
             match result {
