@@ -4,7 +4,20 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - 'crates/core/Cargo.toml'
+      - 'crates/core/src/lib.rs'
+      - 'crates/gui/**'
+      - 'crates/s00-probe/**'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:

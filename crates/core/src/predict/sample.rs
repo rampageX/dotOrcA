@@ -28,10 +28,14 @@ impl Temp{
 impl Drop for Temp{fn drop(&mut self){for i in 0..6{let _=fs::remove_file(self.0.join(format!("{i}.mkv")));}let _=fs::remove_dir(&self.0);}}
 #[derive(Clone,Copy)]
 struct Route{encoder:&'static str,preset:&'static str,codec:&'static str,pix:&'static str}
+fn sample_input_request(ffmpeg:&Path,input:&Path,index:u64,pix:&str,offset:u64,duration:u64)->Request{
+    Request::new(ffmpeg).args(["-hide_banner","-nostdin","-n","-v","error","-progress","pipe:1","-nostats","-ss",&offset.to_string(),"-i"]).args([input.as_os_str()])
+        .args(["-map",&format!("0:{index}"),"-an","-sn","-dn","-t",&duration.to_string(),"-fps_mode","passthrough","-vf",&crate::benchmark::explicit_pixel_format(pix)])
+}
 fn measure(ffmpeg:&Path,ffprobe:&Path,input:&Path,index:u64,route:Route,bitrate:u64,offset:u64,duration:u64,out:&Path,cancel:&AtomicBool)->io::Result<(Sample,Value)>{
     let before=crate::benchmark::pretest_cpu_busy();
-    let mut req=Request::new(ffmpeg).args(["-hide_banner","-nostdin","-n","-v","error","-progress","pipe:1","-nostats","-ss",&offset.to_string(),"-i"]).args([input.as_os_str()])
-        .args(["-map",&format!("0:{index}"),"-an","-sn","-dn","-t",&duration.to_string(),"-fps_mode","passthrough","-vf",&format!("format={}",route.pix),"-c:v",route.encoder,"-preset",route.preset,"-b:v",&bitrate.to_string(),"-pix_fmt",&format!("+{}",route.pix),"-f","matroska"]).args([out.as_os_str()]);
+    let mut req=sample_input_request(ffmpeg,input,index,route.pix,offset,duration)
+        .args(["-c:v",route.encoder,"-preset",route.preset,"-b:v",&bitrate.to_string(),"-pix_fmt",&format!("+{}",route.pix),"-f","matroska"]).args([out.as_os_str()]);
     req.timeout=Duration::from_secs(60);
     let start=Instant::now();let o=process::run(&req,cancel)?;let wall=start.elapsed().as_secs_f64();
     if o.stop!=Stop::Exited||!o.status.success()||o.stdout.discarded!=0{return Err(bad(format!("{} {:?}: {}",route.encoder,o.stop,String::from_utf8_lossy(&o.stderr.bytes))))}
@@ -108,6 +112,24 @@ mod tests{
             assert!(source_color(&stream(extra),true).is_err(),"{extra}");
         }
         let mut deep=v.clone();deep.bit_depth=Some(10);assert!(source_color(&deep,true).is_err());
+    }
+    #[test]
+    #[ignore = "requires external FFmpeg and a generated H.264 source; exercised by S03 CI"]
+    fn strict_nv12_conversion(){
+        let ffmpeg=fs::canonicalize(PathBuf::from(std::env::var_os("DOTORCA_TEST_FFMPEG").expect("FFmpeg path"))).unwrap();
+        let source=fs::canonicalize(PathBuf::from(std::env::var_os("DOTORCA_TEST_SOURCE").expect("source path"))).unwrap();
+        for (offset,duration) in [(0,4),(24,4),(8,12)]{
+            // Exactly the production sample input/filter arguments, but use rawvideo
+            // with strict NV12 and null mux so no NVIDIA GPU is required.
+            let req=sample_input_request(&ffmpeg,&source,0,"nv12",offset,duration)
+                .args(["-c:v","rawvideo","-pix_fmt","+nv12","-f","null","-"]);
+            let o=process::run(&req,&AtomicBool::new(false)).unwrap();
+            assert!(o.stop==Stop::Exited&&o.status.success(),"{}",String::from_utf8_lossy(&o.stderr.bytes));
+            assert_eq!(o.stdout.discarded,0);
+            let progress=String::from_utf8(o.stdout.bytes).unwrap();
+            assert!(progress.lines().any(|s|s.trim()=="progress=end"));
+            assert!(progress.lines().filter_map(|s|s.strip_prefix("frame=")?.trim().parse::<u64>().ok()).last().is_some_and(|n|n>0));
+        }
     }
     #[test] fn projection_and_limits(){
         let a=Sample{source_seconds:4.0,wall_seconds:2.0};let b=Sample{source_seconds:4.0,wall_seconds:4.0};

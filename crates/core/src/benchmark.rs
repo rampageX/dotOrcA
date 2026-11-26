@@ -145,9 +145,11 @@ fn metric(o: &Options, f: Fixture, source: &Path, encoded: &Path, filter: &str, 
     if x.stderr.discarded!=0 {return Err(invalid("metric log truncated"));}
     metric_value(&String::from_utf8_lossy(&x.stderr.bytes),if filter=="ssim" {"SSIM"} else {"PSNR"},key)
 }
+/// Explicit conversion is required when +pix_fmt disables auto-inserted filters.
+pub(crate) fn explicit_pixel_format(pix:&str)->String{format!("scale=iw:ih,format={pix}")}
 fn encode(o: &Options,f: Fixture,e: Encoder,preset: &str,source: &Path,out: &Path,cancel: &AtomicBool,record: &mut Value) -> io::Result<()> {
     let pix=if e.hardware {if f.bits==10 {"p010le"} else {"nv12"}} else {f.pix()};
-    let r=ff(&o.ffmpeg).args(["-v","info","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-fps_mode","passthrough","-vf",&format!("scale=iw:ih,format={pix}"),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
+    let r=ff(&o.ffmpeg).args(["-v","info","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-fps_mode","passthrough","-vf",&explicit_pixel_format(pix),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
     record["argv"]=json!(r.args.iter().map(|a|a.to_string_lossy()).collect::<Vec<_>>());
     let start=Instant::now();
     let x=process::run(&r,cancel);
