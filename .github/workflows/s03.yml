@@ -35,6 +35,24 @@ jobs:
           $holdout = & $exe --holdout | ConvertFrom-Json
           if ($LASTEXITCODE -or $holdout.groups.Count -ne 6 -or ($holdout.groups | Measure-Object -Property predicted -Sum).Sum -ne 144 -or $holdout.confidence_calibrated) { throw 'Invalid holdout diagnostics' }
           $holdout | ConvertTo-Json -Depth 20 | Out-File dist-s03/holdout.json
+      - name: Short source validation (synthetic CI fixture, never training data)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            if ($IsWindows) { choco install ffmpeg --version=9.1.0 -y --no-progress; if ($LASTEXITCODE) { exit $LASTEXITCODE }; $env:Path += ';C:\ProgramData\chocolatey\bin' }
+            else { sudo apt-get update; sudo apt-get install -y ffmpeg; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          }
+          $ffmpeg = (Get-Command ffmpeg -CommandType Application | Select-Object -First 1).Source
+          $ffprobe = (Get-Command ffprobe -CommandType Application | Select-Object -First 1).Source
+          $source = Join-Path (Get-Location) '小K 的鹅腿坟场 & (黑洞) ^ % !.avi'
+          & $ffmpeg -hide_banner -v error -n -f lavfi -i 'testsrc2=size=320x180:rate=24' -t 30 -c:v libx264 -pix_fmt yuv420p -color_trc bt709 -color_primaries bt709 -colorspace bt709 -f matroska $source
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = if ($IsWindows) { './target/release/orca-predict.exe' } else { './target/release/orca-predict' }
+          $r = & $exe --validate $source --ffmpeg $ffmpeg --ffprobe $ffprobe | ConvertFrom-Json
+          if ($LASTEXITCODE -or $r.results[0].status -ne 'ok' -or $r.results[0].samples.Count -ne 2 -or $r.results[0].holdout.encoded_frames -le 0 -or $null -ne $r.results[0].prediction.production_seconds) { throw 'Missing validation evidence' }
+          if ($IsWindows -and $null -eq $r.results[0].samples[0].pretest_system_cpu_busy_pct) { throw 'Missing pretest CPU occupancy' }
+          $r | ConvertTo-Json -Depth 20 | Out-File dist-s03/sample-validation.json
+          Remove-Item -LiteralPath $source
       - name: Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
