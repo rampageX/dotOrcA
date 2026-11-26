@@ -20,9 +20,15 @@ use std::{
 
 pub const CAPACITY: usize = 256;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Bytes(u64),
+    Percent(u8),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
-    limit_bytes: u64,
+    target: Target,
     codec: Codec,
     max_long_edge: u32,
 }
@@ -33,18 +39,32 @@ impl Settings {
             .checked_mul(1_048_576)
             .filter(|&bytes| bytes != 0)
             .ok_or("Enter a positive whole number of MiB within range.")?;
+        Self::with_target(Target::Bytes(limit_bytes), codec, max_long_edge)
+    }
+
+    pub fn percentage(percent: u64, codec: Codec, max_long_edge: u32) -> Result<Self, &'static str> {
+        if !(1..=100).contains(&percent) {
+            return Err("Enter a whole percentage from 1 to 100.");
+        }
+        Self::with_target(Target::Percent(percent as u8), codec, max_long_edge)
+    }
+
+    fn with_target(target: Target, codec: Codec, max_long_edge: u32) -> Result<Self, &'static str> {
         if max_long_edge < 2 {
             return Err("Invalid maximum resolution.");
         }
-        Ok(Self {
-            limit_bytes,
-            codec,
-            max_long_edge,
-        })
+        Ok(Self { target, codec, max_long_edge })
     }
 
-    pub fn limit_mib(self) -> u64 {
-        self.limit_bytes / 1_048_576
+    pub fn target(self) -> Target {
+        self.target
+    }
+
+    pub fn limit_bytes(self, source_bytes: u64) -> u64 {
+        match self.target {
+            Target::Bytes(bytes) => bytes,
+            Target::Percent(percent) => ((u128::from(source_bytes) * u128::from(percent)) / 100) as u64,
+        }
     }
 
     pub fn codec(self) -> Codec {
@@ -67,13 +87,14 @@ pub enum Phase {
     Retrying,
     Cancelling,
     Published,
+    Skipped,
     Failed,
     Cancelled,
 }
 
 impl Phase {
     pub fn finished(self) -> bool {
-        matches!(self, Self::Published | Self::Failed | Self::Cancelled)
+        matches!(self, Self::Published | Self::Skipped | Self::Failed | Self::Cancelled)
     }
 }
 
@@ -84,6 +105,7 @@ pub struct Job {
     pub source_bytes: Option<u64>,
     pub source_size_pending: bool,
     pub settings: Option<Settings>,
+    pub target_bytes: Option<u64>,
     pub phase: Phase,
     pub encoder: Option<&'static str>,
     pub progress_percent: Option<u8>,
@@ -197,6 +219,7 @@ impl Queue {
                 source_bytes: None,
                 source_size_pending: true,
                 settings: None,
+                target_bytes: None,
                 phase: Phase::Waiting,
                 encoder: None,
                 progress_percent: None,
@@ -316,8 +339,10 @@ fn read_source_sizes(shared: &Shared) {
         };
         let bytes = fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len());
         Updates { shared, id }.modify(|job| {
-            job.source_bytes = bytes;
-            job.source_size_pending = false;
+            if job.source_size_pending {
+                job.source_bytes = bytes;
+                job.source_size_pending = false;
+            }
         });
     }
 }
@@ -488,6 +513,31 @@ fn encode(
         if cancel.load(Ordering::Acquire) {
             return Err(pipeline::Error::Cancelled);
         }
+        // Re-read only filesystem metadata, not media contents. A queued file
+        // may have changed since its background size was displayed.
+        let meta = fs::metadata(&job.source).map_err(pipeline::Error::Io)?;
+        if !meta.is_file() || meta.len() == 0 {
+            return Err(pipeline::Error::UnsupportedMedia("Source must be a nonempty file."));
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(pipeline::Error::Cancelled);
+        }
+        let source_bytes = meta.len();
+        let settings = job.settings.expect("started job");
+        let limit = settings.limit_bytes(source_bytes);
+        update.modify(|job| {
+            job.source_bytes = Some(source_bytes);
+            job.source_size_pending = false;
+            job.target_bytes = Some(limit);
+        });
+        if source_bytes <= limit {
+            // Size is the primary goal, regardless of requested codec/edge.
+            // Do not create a duplicate, invoke FFmpeg, or write learning data.
+            return Ok(None);
+        }
+        if limit == 0 {
+            return Err(pipeline::Error::UnsupportedMedia("Target rounds down to zero bytes."));
+        }
         let dir = root.join("output");
         fs::create_dir_all(&dir).map_err(|e| {
             pipeline::Error::Io(io::Error::new(
@@ -531,7 +581,7 @@ fn encode(
                 destination: &destination,
                 ffmpeg: &ffmpeg,
                 ffprobe: &ffprobe,
-                limit_bytes: job.settings.expect("started job").limit_bytes,
+                limit_bytes: limit,
                 codec: job.settings.expect("started job").codec,
                 max_long_edge: job.settings.expect("started job").max_long_edge,
                 timeout: Duration::from_secs(86_400),
@@ -549,13 +599,22 @@ fn encode(
                     }
                 });
             }),
-        )
+        ).map(Some)
     })();
     if let Some(mut completed) = update.modify(|current| current.clone()) {
         let job = &mut completed;
         job.progress_percent = None;
         match result {
-            Ok(publication) => {
+            Ok(None) => {
+                if cancel.load(Ordering::Acquire) {
+                    job.phase = Phase::Cancelled;
+                    note(job, "Cancelled during processing.".into());
+                } else {
+                    job.phase = Phase::Skipped;
+                    note(job, "Source already within target capacity. Original retained; no output created.".into());
+                }
+            }
+            Ok(Some(publication)) => {
                 let out = publication.output;
                 job.phase = Phase::Published;
                 job.output = Some(out.path);
@@ -650,6 +709,52 @@ mod tests {
     }
 
     #[test]
+    fn percentage_targets_are_exact_and_bounded() {
+        let settings = Settings::percentage(60, Codec::Hevc, 1920).unwrap();
+        assert_eq!(settings.limit_bytes(101), 60);
+        assert_eq!(settings.limit_bytes(u64::MAX), (u128::from(u64::MAX) * 60 / 100) as u64);
+        assert!(Settings::percentage(0, Codec::Hevc, 1920).is_err());
+        assert!(Settings::percentage(101, Codec::Hevc, 1920).is_err());
+        assert_eq!(Settings::percentage(100, Codec::Hevc, 1920).unwrap().limit_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn already_small_files_skip_without_tools_or_outputs() {
+        let root = std::env::temp_dir().join(format!("dotorca-skip-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        let equal = root.join("equal.mp4");
+        let big = root.join("big.mp4");
+        fs::write(&path, [0u8; 100]).unwrap();
+        fs::File::create(&equal).unwrap().set_len(1_048_576).unwrap();
+        fs::File::create(&big).unwrap().set_len(1_048_577).unwrap();
+        let queue = Queue::portable(root.clone()).unwrap();
+        for p in [&path, &equal, &big] { queue.add(p).unwrap(); }
+        queue.start(settings()).unwrap();
+        let jobs = await_finished(&queue);
+        assert_eq!(jobs[0].phase, Phase::Skipped);
+        assert_eq!(jobs[1].phase, Phase::Skipped);
+        assert_eq!(jobs[2].phase, Phase::Failed); // no encoding tools
+        assert!(jobs[0].output.is_none() && jobs[0].encoder.is_none());
+        assert_eq!(jobs[1].target_bytes, Some(1_048_576));
+        queue.clear_finished();
+        queue.add(&path).unwrap();
+        queue.start(Settings::percentage(100, Codec::Hevc, 1920).unwrap()).unwrap();
+        assert_eq!(await_finished(&queue)[0].phase, Phase::Skipped);
+        queue.clear_finished();
+        queue.add(&path).unwrap();
+        queue.start(Settings::percentage(50, Codec::Hevc, 1920).unwrap()).unwrap();
+        let jobs = await_finished(&queue);
+        assert_eq!(jobs[0].target_bytes, Some(50));
+        assert_eq!(jobs[0].phase, Phase::Failed);
+        assert!(fs::read_dir(root.join("output")).unwrap().next().is_none());
+        assert!(!root.join("data/local/production-v1.json").exists());
+        queue.shutdown();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 100);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn source_sizes_arrive_without_start_and_handle_missing_paths() {
         let root = std::env::temp_dir().join(format!("dotorca-size-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -715,16 +820,16 @@ mod tests {
         let chosen = Settings::new(30, Codec::Hevc, 1920).unwrap();
         queue.start(chosen).unwrap();
         let actual = running.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(actual.limit_mib(), 30);
+        assert_eq!(actual.limit_bytes(0) / 1_048_576, 30);
         assert_eq!(actual.codec(), Codec::Hevc);
         assert_eq!(actual.max_long_edge(), 1920);
         let later = queue.add(&path).unwrap();
         assert!(queue.snapshot().iter().find(|j| j.id == later).unwrap().settings.is_none());
         queue.start(settings()).unwrap();
         let jobs = queue.snapshot();
-        assert_eq!(jobs[0].settings.unwrap().limit_mib(), 30);
-        assert_eq!(jobs[1].settings.unwrap().limit_mib(), 30);
-        assert_eq!(jobs[2].settings.unwrap().limit_mib(), 1);
+        assert_eq!(jobs[0].settings.unwrap().limit_bytes(0) / 1_048_576, 30);
+        assert_eq!(jobs[1].settings.unwrap().limit_bytes(0) / 1_048_576, 30);
+        assert_eq!(jobs[2].settings.unwrap().limit_bytes(0) / 1_048_576, 1);
         queue.clear_all();
         assert!(queue.is_clearing());
         let jobs = queue.snapshot();
@@ -820,7 +925,9 @@ mod tests {
                     "-i",
                     "testsrc2=size=320x180:rate=25:duration=2",
                     "-c:v",
-                    "ffv1",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
                     "-f",
                     "avi",
                 ])
@@ -838,6 +945,7 @@ mod tests {
             });
         })
         .unwrap();
+        assert!(fs::metadata(&source).unwrap().len() > 1_048_576);
         queue.add(&source).unwrap();
         queue.add(&source).unwrap();
         queue
@@ -872,6 +980,15 @@ mod tests {
         assert!(queue.snapshot().is_empty());
         assert!(source.exists());
         assert!(jobs[0].output.as_ref().unwrap().is_file());
+        let percent_source = root.join("percent 🎬.avi");
+        fs::copy(&source, &percent_source).unwrap();
+        let source_bytes = fs::metadata(&percent_source).unwrap().len();
+        queue.add(&percent_source).unwrap();
+        queue.start(Settings::percentage(25, Codec::H264, 256).unwrap()).unwrap();
+        let percent = await_finished(&queue);
+        assert_eq!(percent[0].phase, Phase::Published, "{:?}", percent[0]);
+        assert_eq!(percent[0].target_bytes, Some(source_bytes / 4));
+        assert!(percent[0].bytes.unwrap() <= source_bytes / 4);
         queue.shutdown();
     }
 }

@@ -2,7 +2,7 @@
 //! one immutable snapshot per frame. No worker calls back into C.
 use orca_core::{
     budget::Codec,
-    queue::{Job, Phase, Queue, Settings},
+    queue::{Job, Phase, Queue, Settings, Target},
 };
 use std::{cell::RefCell, ffi::c_char, path::Path, ptr, sync::Arc};
 
@@ -94,23 +94,28 @@ pub unsafe extern "C" fn orca_add_path(
 pub unsafe extern "C" fn orca_start(
     size: *const c_char,
     size_len: usize,
+    mode: i32,
     codec: i32,
     edge: u32,
 ) -> i32 {
     boundary(|app| {
         app.notice.clear();
         let started = (|| {
-            let mib = unsafe { utf8(size, size_len, 24) }?
+            let value = unsafe { utf8(size, size_len, 24) }?
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| "Enter the target as whole MiB.")?;
+                .map_err(|_| "Enter a whole number for the target.")?;
             let codec = match codec {
                 0 => Codec::H264,
                 1 => Codec::Hevc,
                 2 => Codec::Av1,
                 _ => return Err("Invalid output codec.".into()),
             };
-            let settings = Settings::new(mib, codec, edge)?;
+            let settings = match mode {
+                0 => Settings::new(value, codec, edge)?,
+                1 => Settings::percentage(value, codec, edge)?,
+                _ => return Err("Invalid capacity mode.".into()),
+            };
             app.queue()?.start(settings)?;
             Ok::<_, String>(())
         })();
@@ -157,6 +162,7 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .iter()
             .filter(|j| j.phase == Phase::Published)
             .count();
+        let skipped = app.snapshot.iter().filter(|j| j.phase == Phase::Skipped).count();
         let failed = app
             .snapshot
             .iter()
@@ -166,7 +172,7 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .snapshot
             .iter()
             .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
-        let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {failed} failed   |   {} cancelled", finished - published - failed);
+        let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {skipped} skipped   |   {failed} failed   |   {} cancelled", finished - published - skipped - failed);
         if clearing {
             text.push_str("   |   Stopping and clearing all tasks…");
         }
@@ -255,15 +261,28 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Retrying => "Retrying (capacity)",
             Phase::Cancelling => "Cancelling",
             Phase::Published => "Saved",
+            Phase::Skipped => "Skipped",
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
         let mut status = format!("{phase}  |  Source {}", source_size(job));
         if let Some(settings) = job.settings {
-            status.push_str(&format!(
-                "  |  Target ≤ {} MiB  |  {:?}  |  {} px max",
-                settings.limit_mib(), settings.codec(), settings.max_long_edge()
-            ));
+            let target = match settings.target() {
+                Target::Bytes(bytes) => format!("{} MiB", bytes / 1_048_576),
+                Target::Percent(percent) => {
+                    let bytes = job.target_bytes.or_else(|| job.source_bytes.map(|n| settings.limit_bytes(n)));
+                    match bytes {
+                        Some(n) => format!("{percent}% ({})", readable_size(n)),
+                        None => format!("{percent}% (size unknown)"),
+                    }
+                }
+            };
+            status.push_str(&format!("  |  Target ≤ {target}"));
+            if job.phase != Phase::Skipped {
+                status.push_str(&format!("  |  {:?}  |  {} px max", settings.codec(), settings.max_long_edge()));
+            } else {
+                status.push_str("  |  Original retained");
+            }
         } else if job.phase == Phase::Waiting {
             status.push_str("  |  Settings applied on Start");
         }
@@ -366,8 +385,10 @@ mod tests {
             );
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 1);
-            assert_eq!(orca_start(size.as_ptr().cast(), 0, 1, 1920), 0);
-            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), -1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), 0, 0, 1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), 0, -1, 1920), 0);
+            assert_eq!(orca_start(b"101".as_ptr().cast(), 3, 1, 1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), 2, 1, 1920), 0);
             let mut row = std::mem::MaybeUninit::<Row>::uninit();
             assert_eq!(orca_row(0, row.as_mut_ptr(), 1), -1);
             assert_eq!(orca_row(0, row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);

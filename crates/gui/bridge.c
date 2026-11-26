@@ -20,7 +20,7 @@ typedef struct {
 } orca_job_row;
 
 extern int32_t orca_add_path(const char *path, size_t path_len);
-extern int32_t orca_start(const char *size, size_t size_len, int32_t codec, uint32_t edge);
+extern int32_t orca_start(const char *size, size_t size_len, int32_t mode, int32_t codec, uint32_t edge);
 extern int32_t orca_action(uint32_t action, uint32_t id);
 extern int32_t orca_frame(char *out, size_t capacity, uint32_t *count);
 extern int32_t orca_row(uint32_t index, orca_job_row *out, size_t capacity);
@@ -31,6 +31,8 @@ static const uint32_t edges[] = { 3840, 2560, 1920, 1280 };
 
 typedef struct {
     char mib[24];
+    char percent[24];
+    int target_mode;
     int codec;
     int resolution;
     uint32_t expanded;
@@ -141,6 +143,7 @@ static int apply_window_icon(HWND hwnd) {
 }
 
 static void frame(cui_ctx *ui, void *user) {
+    static const char *modes[] = { "Fixed size", "% of source" };
     static const char *codecs[] = { "H.264", "HEVC", "AV1" };
     static const char *resolutions[] = { "3840 px", "2560 px", "1920 px", "1280 px" };
     window_state *window = (window_state *)user;
@@ -164,14 +167,23 @@ static void frame(cui_ctx *ui, void *user) {
                .bg = CUI_COLOR_BACKGROUND) {
         cui_heading(ui, "dotOrcA", 1);
         cui_row(ui, .width = CUI_FILL, .gap = 12) {
-            cui_input(ui, "mib", window->mib, sizeof(window->mib),
-                      .label = "Capacity per file", .suffix = "MiB", .width = CUI_FILL);
+            cui_select(ui, "target-mode", modes, 2, &window->target_mode,
+                       .label = "Capacity mode", .width = CUI_FILL);
+            if (window->target_mode == 0) {
+                cui_input(ui, "mib", window->mib, sizeof(window->mib),
+                          .label = "Capacity per file", .suffix = "MiB", .width = CUI_FILL);
+            } else {
+                cui_input(ui, "percent", window->percent, sizeof(window->percent),
+                          .label = "Output / source", .suffix = "%", .width = CUI_FILL);
+            }
             cui_select(ui, "codec", codecs, 3, &window->codec,
                        .label = "Output codec", .width = CUI_FILL);
             cui_select(ui, "max-edge", resolutions, 4, &window->resolution,
                        .label = "Max. long edge", .width = CUI_FILL);
         }
-        cui_secondary(ui, "1 MiB = 1,048,576 bytes. Each file gets its own limit. Current settings apply to all queued files when Start is clicked.");
+        cui_secondary(ui, window->target_mode == 0
+            ? "Files already within the MiB limit are skipped. Settings apply on Start."
+            : "50% means half the original file size. Each file gets its own limit. Settings apply on Start.");
         cui_column(ui, .width = CUI_FILL, .pad = 10, .bg = CUI_COLOR_SURFACE_RAISED) {
             cui_text(ui, "Drop video files anywhere in this window (up to 64 per drop).");
         }
@@ -184,7 +196,8 @@ static void frame(cui_ctx *ui, void *user) {
         cui_text(ui, busy < 0 || window->callback_error ? "Queue interface error." : status, .width = CUI_FILL);
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
             if (cui_button(ui, "Start queued", .variant = CUI_BUTTON_PRIMARY, .disabled = !count)) {
-                window->callback_error = orca_start(window->mib, strlen(window->mib),
+                const char *value = window->target_mode == 0 ? window->mib : window->percent;
+                window->callback_error = orca_start(value, strlen(value), window->target_mode,
                     window->codec, edges[window->resolution]) < 0;
                 cui_request_redraw(ui);
             }
@@ -228,7 +241,7 @@ static cui_app_desc description(void) {
 }
 
 int orca_cui_run(void) {
-    window_state window = { .mib = "100", .codec = 1, .resolution = 0 };
+    window_state window = { .mib = "100", .percent = "50", .codec = 1, .resolution = 0 };
     cui_app_desc desc = description();
     return cui_app_run(&desc, frame, &window);
 }
@@ -267,7 +280,7 @@ int orca_cui_self_test(void) {
         return result;
     }
     result = 11;
-    window_state window = { .mib = "100", .codec = 1, .font_pending = 1, .font_tried = 1, .icon_tried = 1 };
+    window_state window = { .mib = "100", .percent = "50", .codec = 1, .font_pending = 1, .font_tried = 1, .icon_tried = 1 };
     if (!cui_app_is_software(app) || !cui_app_frame(app)) goto done;
     cui_ctx *ui = cui_app_ui(app);
     frame(ui, &window);
