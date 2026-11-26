@@ -1,6 +1,7 @@
 //! S06 encoding, validation and no-clobber publication.
 use crate::{
     budget::{self, Codec, Plan},
+    dataset::{Fingerprint, Observation, Outcome, Profile, Store},
     decision::{self, CheckResult, Decision, Job, RequestCheck, Route, Selection},
     hardware::Detector,
     media::{self, Hdr, MediaInfo, Stream},
@@ -456,7 +457,46 @@ pub fn encode(
     request: &EncodeRequest<'_>,
     detector: &mut Detector,
     cancel: &AtomicBool,
+    observe: impl FnMut(Event<'_>),
+) -> Result<Published, Error> {
+    encode_inner(request, detector, cancel, observe, None)
+}
+
+#[derive(Debug)]
+pub struct TrackedPublication {
+    pub output: Published,
+    pub learning: io::Result<()>,
+}
+
+/// Runs the S06 pipeline and records only a verified, successfully
+/// published result. A storage failure leaves the output successful.
+pub fn encode_and_learn(
+    request: &EncodeRequest<'_>,
+    detector: &mut Detector,
+    cancel: &AtomicBool,
+    observe: impl FnMut(Event<'_>),
+    store: &Store,
+) -> Result<TrackedPublication, Error> {
+    check_cancel(cancel)?;
+    let fingerprint = Fingerprint::read(request.ffmpeg, request.ffprobe);
+    let mut observation = None;
+    let tracking = fingerprint.as_ref().ok().map(|id| (id, &mut observation));
+    let output = encode_inner(request, detector, cancel, observe, tracking)?;
+    let learning = fingerprint.and_then(|before| {
+        if before != Fingerprint::read(request.ffmpeg, request.ffprobe)? {
+            return Err(io::Error::other("encoding tools changed during production"));
+        }
+        store.record(observation.expect("tracked publication creates a production observation"))
+    });
+    Ok(TrackedPublication { output, learning })
+}
+
+fn encode_inner(
+    request: &EncodeRequest<'_>,
+    detector: &mut Detector,
+    cancel: &AtomicBool,
     mut observe: impl FnMut(Event<'_>),
+    tracking: Option<(&Fingerprint, &mut Option<Observation>)>,
 ) -> Result<Published, Error> {
     let start = Instant::now();
     check_cancel(cancel)?;
@@ -516,6 +556,8 @@ pub fn encode(
     let mut passed = Vec::new();
     let mut rate = plan.video_bps;
     let mut reencodes = 0;
+    let mut failed_preflights = Vec::new();
+    let mut failed_encodes = Vec::new();
 
     loop {
         check_cancel(cancel)?;
@@ -530,12 +572,15 @@ pub fn encode(
                 route,
                 video_bps: rate,
             });
+            let attempt_start = Instant::now();
+            let mut encode_elapsed = Duration::ZERO;
             let result = (|| {
                 run_encoder(
                     &encode_command(request, &source, &plan, clock, route, rate, false, &output),
                     route.encoder(plan.codec),
                     cancel,
                 )?;
+                encode_elapsed = attempt_start.elapsed();
                 validate(request, &plan, clock, &original, &output, false, cancel)
             })();
             match result {
@@ -546,13 +591,36 @@ pub fn encode(
                     if budget::fits(plan.limit_bytes, Some(bytes)) {
                         unchanged(&source.path, &source_meta, cancel)?;
                         publish(&output, &destination, cancel)?;
+                        let elapsed = start.elapsed();
+                        if let Some((tools, slot)) = tracking {
+                            let profile = Profile::new(
+                                &source,
+                                &plan,
+                                &hardware.inventory,
+                                route,
+                                rate,
+                                tools.clone(),
+                            );
+                            *slot = Some(Observation::published(
+                                profile,
+                                Outcome {
+                                    total: elapsed,
+                                    encode: encode_elapsed,
+                                    bytes,
+                                    retries: reencodes,
+                                    failed_preflights,
+                                    failed_encodes,
+                                    selection: decision.selection,
+                                },
+                            ));
+                        }
                         return Ok(Published {
                             path: destination,
                             bytes,
                             route,
                             selection: decision.selection,
                             video_bps: rate,
-                            elapsed: start.elapsed(),
+                            elapsed,
                             production_eta: None,
                         });
                     }
@@ -571,6 +639,7 @@ pub fn encode(
                     passed.clear();
                 }
                 Err(AttemptError::Route(detail)) => {
+                    failed_encodes.push(route.encoder(plan.codec));
                     observe(Event::RouteFailed {
                         route,
                         detail: &detail,
@@ -626,6 +695,7 @@ pub fn encode(
         if result == CheckResult::Compatible {
             passed.push(check);
         } else {
+            failed_preflights.push(route.encoder(plan.codec));
             excluded.push(check);
         }
     }

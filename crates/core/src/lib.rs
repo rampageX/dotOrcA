@@ -8,3 +8,4 @@ pub mod predict;
 pub mod budget;
 pub mod decision;
 pub mod pipeline;
+pub mod dataset;
