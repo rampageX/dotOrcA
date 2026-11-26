@@ -15,8 +15,8 @@ fn run()->io::Result<()>{
     let mut args=std::env::args_os().skip(1);
     while let Some(a)=args.next(){
         match a.to_str(){
-            Some("--help"|"-h")=>{println!("orca-predict --info | --probe [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
-            Some("--info"|"--probe") if mode.is_none()=>mode=a.into_string().ok(),
+            Some("--help"|"-h")=>{println!("orca-predict --info | --holdout | --probe [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --holdout: CPU cross-validation; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
+            Some("--info"|"--holdout"|"--probe") if mode.is_none()=>mode=a.into_string().ok(),
             Some("--ffmpeg")=>ffmpeg=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffmpeg path"))?),
             Some("--ffprobe")=>ffprobe=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffprobe path"))?),
             Some("--local") if local.is_none()=>local=Some(PathBuf::from(args.next().ok_or_else(||io::Error::other("missing local dataset path"))?)),
@@ -26,7 +26,8 @@ fn run()->io::Result<()>{
     let mut db=Database::bundled()?;
     if let Some(p)=local{db=db.with_local(&p)?;}
     if mode.as_deref()==Some("--info"){println!("{}",serde_json::to_string_pretty(&db.info()).map_err(io::Error::other)?);return Ok(())}
-    if mode.as_deref()!=Some("--probe"){return Err(io::Error::other("select --info or --probe"))}
+    if mode.as_deref()==Some("--holdout"){println!("{}",serde_json::to_string_pretty(&db.cpu_holdout()).map_err(io::Error::other)?);return Ok(())}
+    if mode.as_deref()!=Some("--probe"){return Err(io::Error::other("select --info, --holdout or --probe"))}
     let ffmpeg=std::fs::canonicalize(ffmpeg)?;let ffprobe=std::fs::canonicalize(ffprobe)?;
     let cancel=AtomicBool::new(false);
     let report=hardware::Detector::default().detect(&ffmpeg,&cancel)?;
