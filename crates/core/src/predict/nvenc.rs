@@ -2,7 +2,7 @@
 use super::{aliases,Database};
 use serde_json::{json,Value};
 
-pub const VERSION:&str="nvenc-sdk13.1-v1";
+pub const VERSION:&str="nvenc-sdk13.1-v2";
 pub struct NvencQuery<'a>{
     pub gpu_name:&'a str,pub codec:&'a str,pub preset:u8,
     pub width:u32,pub height:u32,pub bit_depth:u8,pub chroma:&'a str,
@@ -43,6 +43,7 @@ mod tests{
         q.bit_depth=10;assert_eq!(db.nvenc_reference(&q)["kind"],"unknown");q.bit_depth=8;
         q.gpu_name="NVIDIA T600";assert_eq!(db.nvenc_reference(&q)["reason"],"no_matching_engine_generation");
         q.gpu_name="NVIDIA T600 Laptop GPU";assert_eq!(db.nvenc_reference(&q)["reason"],"mobile_not_calibrated");
+        q.gpu_name="NVIDIA GeForce RTX 5090";q.codec="av1";q.preset=5;q.video_clock_mhz=Some(2257);let x=db.nvenc_reference(&q);assert_eq!(x["estimated_per_engine_fps"],552.0);assert_eq!(x["engine_count"],3);
         q.gpu_name="unknown";assert_eq!(db.nvenc_reference(&q)["kind"],"unknown");
     }
 }
