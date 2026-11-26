@@ -11,6 +11,7 @@ on:
       - '.cargo/**'
       - 'crates/core/Cargo.toml'
       - 'crates/core/src/lib.rs'
+      - 'crates/core/src/bin/orca-verify.rs'
       - 'crates/gui/**'
       - 'crates/s00-probe/**'
       - '.github/workflows/ci.yml'
@@ -65,6 +66,9 @@ jobs:
           }
           if ($process.ExitCode -ne 0) { throw "Native drop self-test failed ($($process.ExitCode))" }
           Copy-Item $exe ../../dist/
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p orca-core --bin orca-verify
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item ../../target/x86_64-pc-windows-msvc/release/orca-verify.exe ../../dist/
           Copy-Item ../../Cargo.lock ../../dist/
           (Get-Item $exe).Length | Out-File ../../dist/size-bytes.txt
           Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File ../../dist/sha256.txt
@@ -83,6 +87,6 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: dotOrcA-S08
+          name: dotOrcA-S09-validation
           path: dist/
           if-no-files-found: error
