@@ -4,6 +4,8 @@ use std::{collections::HashSet,fs,io,path::Path};
 use crate::hardware::{Inventory,Capability,Evidence};
 
 pub const MODEL_VERSION:&str="reference-pipeline-v1";
+/// Same SHA256 route used by S02, not just the displayed FFmpeg version.
+pub fn tool_sha256(ffmpeg:&Path,tool:&Path,cancel:&std::sync::atomic::AtomicBool)->io::Result<String>{crate::benchmark::file_hash(ffmpeg,tool,cancel)}
 const OFFICIAL:&str=include_str!("../../../data/official/s02-physical-v1.json");
 const MAP:&str=include_str!("../../../data/official/hardware-map-v1.json");
 const MAX_BYTES:u64=16*1024*1024;
@@ -184,6 +186,20 @@ mod tests{
             let mut other=hw.clone();other.cpu=Some("unknown model".into());q.inventory=&other;
             assert_eq!(db.estimate(&q)["kind"],"unknown");n+=1;
         }assert_eq!(n,264)
+    }
+    #[test]fn mapped_cpu_and_gpu_boundaries(){
+        let db=Database::bundled().unwrap();
+        let (d,f,r)=db.reference_cases().find(|(d,_,r)|d["machine"]=="desktop"&&r["encoder"]=="libx264").unwrap();
+        let e=&d["environment"];let mut hw=inv(e);hw.cpu=Some("Intel Core i5-12400".into());hw.logical_cpus=Some(12);
+        let q=Query{inventory:&hw,capabilities:&[],ffmpeg_sha256:e["ffmpeg_sha256"].as_str().unwrap(),ffprobe_sha256:e["ffprobe_sha256"].as_str().unwrap(),encoder:"libx264",preset:r["preset"].as_str().unwrap(),width:f["width"].as_u64().unwrap() as u32,height:f["height"].as_u64().unwrap() as u32,bit_depth:r["bit_depth"].as_u64().unwrap() as u8,target_bitrate_bps:f["target_bitrate_bps"].as_u64().unwrap(),fixture_decoded_sha256:f["decoded_sha256"].as_str(),frames:180};
+        let x=db.estimate(&q);assert_eq!(x["kind"],"inferred_cpu_reference");assert_eq!(x["confidence"],"low_unvalidated_proxy");assert!(x["production_seconds"].is_null());
+        assert!(x["heuristic_fps_range"][0].as_f64().unwrap()<=x["pipeline_fps"].as_f64().unwrap());
+        let mut g=inv(e);g.adapters[0].name=Some("NVIDIA GeForce RTX 4090".into());
+        let (_,f,r)=db.reference_cases().find(|(d,_,r)|d["machine"]=="desktop"&&r["encoder"]=="hevc_nvenc").unwrap();
+        let cap=[Capability{encoder:"hevc_nvenc".into(),bit_depth:r["bit_depth"].as_u64().unwrap() as u8,evidence:Evidence::Verified,diagnostic:String::new()}];
+        let q=Query{inventory:&g,capabilities:&cap,ffmpeg_sha256:e["ffmpeg_sha256"].as_str().unwrap(),ffprobe_sha256:e["ffprobe_sha256"].as_str().unwrap(),encoder:"hevc_nvenc",preset:r["preset"].as_str().unwrap(),width:f["width"].as_u64().unwrap() as u32,height:f["height"].as_u64().unwrap() as u32,bit_depth:cap[0].bit_depth,target_bitrate_bps:f["target_bitrate_bps"].as_u64().unwrap(),fixture_decoded_sha256:f["decoded_sha256"].as_str(),frames:180};
+        assert_eq!(db.estimate(&q)["kind"],"unknown");
+        assert_eq!(db.hardware_mapping(&g)["gpus"][0]["mapping"]["nvenc_engines"],2);
     }
     #[test]fn rejects_invalid_data(){
         assert!(parse(OFFICIAL,"local").is_err());
