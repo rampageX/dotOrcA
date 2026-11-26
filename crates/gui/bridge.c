@@ -1,6 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shellapi.h>
+#include <shlobj.h>
 #include <cui/cui.h>
 #include <cui/cui_app.h>
 #include <stdint.h>
