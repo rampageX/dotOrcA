@@ -54,7 +54,18 @@ jobs:
           if ($LASTEXITCODE -or $r.results[0].status -ne 'ok' -or $r.results[0].samples.Count -ne 2 -or $r.results[0].holdout.encoded_frames -le 0 -or $null -ne $r.results[0].prediction.production_seconds) { throw 'Missing validation evidence' }
           if ($IsWindows -and $null -eq $r.results[0].samples[0].pretest_system_cpu_busy_pct) { throw 'Missing pretest CPU occupancy' }
           $r | ConvertTo-Json -Depth 20 | Out-File dist-s03/sample-validation.json
-          Remove-Item -LiteralPath $source
+          $untagged = Join-Path (Get-Location) 'untagged SDR 小K & (黑洞) ^ % !.mp4'
+          & $ffmpeg -hide_banner -v error -n -i $source -map 0:v:0 -c:v copy -bsf:v 'h264_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients=1' -color_trc unspecified -color_primaries unspecified -colorspace bt709 $untagged
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tags2 = & $ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_transfer,color_space -of json $untagged | ConvertFrom-Json
+          if ($LASTEXITCODE -or $tags2.streams[0].pix_fmt -ne 'yuv420p' -or $tags2.streams[0].color_space -ne 'bt709' -or ($tags2.streams[0].color_transfer -notin @($null,'unknown','unspecified'))) { throw 'Untagged fixture metadata mismatch' }
+          & $exe --validate $untagged --ffmpeg $ffmpeg --ffprobe $ffprobe
+          if ($LASTEXITCODE -eq 0) { throw 'Untagged source accepted without explicit consent' }
+          $global:LASTEXITCODE = 0
+          $u = & $exe --validate $untagged --assume-sdr --ffmpeg $ffmpeg --ffprobe $ffprobe | ConvertFrom-Json
+          if ($LASTEXITCODE -or $u.source.hdr_classification -ne 'Unknown' -or $u.source.color_basis -ne 'user_confirmed_untagged_sdr' -or $u.results[0].status -ne 'ok') { throw 'Explicitly confirmed SDR regression failed' }
+          $u | ConvertTo-Json -Depth 20 | Out-File dist-s03/untagged-validation.json
+          Remove-Item -LiteralPath $source,$untagged
       - name: Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
