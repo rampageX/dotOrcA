@@ -13,18 +13,21 @@ fn run()->io::Result<()>{
     let mut local=None;
     let mut mode=None;
     let mut input=None;
+    let mut assume_sdr=false;
     let mut args=std::env::args_os().skip(1);
     while let Some(a)=args.next(){
         match a.to_str(){
-            Some("--help"|"-h")=>{println!("orca-predict --info | --holdout | --probe | --validate PATH [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --holdout: CPU cross-validation; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
+            Some("--help"|"-h")=>{println!("orca-predict --info | --holdout | --probe | --validate PATH [--assume-sdr] [--ffmpeg PATH --ffprobe PATH] [--local DATASET]\n--info: validate versioned bundled data; --holdout: CPU cross-validation; --probe: actual inventory/capability and tool fingerprints, reference estimates only.");return Ok(())}
             Some("--info"|"--holdout"|"--probe") if mode.is_none()=>mode=a.into_string().ok(),
             Some("--validate") if mode.is_none()=>{mode=Some("--validate".into());input=Some(PathBuf::from(args.next().ok_or_else(||io::Error::other("missing source path"))?));},
+            Some("--assume-sdr") if !assume_sdr=>assume_sdr=true,
             Some("--ffmpeg")=>ffmpeg=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffmpeg path"))?),
             Some("--ffprobe")=>ffprobe=PathBuf::from(args.next().ok_or_else(||io::Error::other("missing ffprobe path"))?),
             Some("--local") if local.is_none()=>local=Some(PathBuf::from(args.next().ok_or_else(||io::Error::other("missing local dataset path"))?)),
             _=>return Err(io::Error::other("unknown or duplicate argument"))
         }
     }
+    if assume_sdr&&input.is_none(){return Err(io::Error::other("--assume-sdr requires --validate"))}
     let mut db=Database::bundled()?;
     if let Some(p)=local{db=db.with_local(&p)?;}
     if mode.as_deref()==Some("--info"){println!("{}",serde_json::to_string_pretty(&db.info()).map_err(io::Error::other)?);return Ok(())}
@@ -36,7 +39,7 @@ fn run()->io::Result<()>{
     let ffhash=tool_sha256(&ffmpeg,&ffmpeg,&cancel)?;
     let fphash=tool_sha256(&ffmpeg,&ffprobe,&cancel)?;
     if let Some(input)=input{
-        let mut v=orca_core::predict::sample::validate(&ffmpeg,&ffprobe,&input,&report,&cancel)?;
+        let mut v=orca_core::predict::sample::validate(&ffmpeg,&ffprobe,&input,&report,assume_sdr,&cancel)?;
         v["ffmpeg_sha256"]=json!(ffhash);v["ffprobe_sha256"]=json!(fphash);
         v["cpu"]=json!(report.inventory.cpu);v["hardware"]=db.hardware_mapping(&report.inventory);
         v["adapters"]=json!(report.inventory.adapters.iter().map(|a|json!({"name":a.name,"driver_version":a.driver_version})).collect::<Vec<_>>());
