@@ -73,14 +73,33 @@ unsafe fn write_text(out: *mut c_char, capacity: usize, text: &str) -> bool {
 pub unsafe extern "C" fn orca_add_path(
     path: *const c_char,
     path_len: usize,
+) -> i32 {
+    boundary(|app| {
+        let added = (|| {
+            let path = unsafe { utf8(path, path_len, 131_072) }?;
+            app.queue()?.add(Path::new(path))?;
+            Ok::<_, String>(())
+        })();
+        match added {
+            Ok(()) => 1,
+            Err(error) => {
+                app.notice = error;
+                0
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn orca_start(
     size: *const c_char,
     size_len: usize,
     codec: i32,
     edge: u32,
 ) -> i32 {
     boundary(|app| {
-        let added = (|| {
-            let path = unsafe { utf8(path, path_len, 131_072) }?;
+        app.notice.clear();
+        let started = (|| {
             let mib = unsafe { utf8(size, size_len, 24) }?
                 .trim()
                 .parse::<u64>()
@@ -92,10 +111,10 @@ pub unsafe extern "C" fn orca_add_path(
                 _ => return Err("Invalid output codec.".into()),
             };
             let settings = Settings::new(mib, codec, edge)?;
-            app.queue()?.add(Path::new(path), settings)?;
+            app.queue()?.start(settings)?;
             Ok::<_, String>(())
         })();
-        match added {
+        match started {
             Ok(()) => 1,
             Err(error) => {
                 app.notice = error;
@@ -113,14 +132,9 @@ pub extern "C" fn orca_action(action: u32, id: u32) -> i32 {
             return 0;
         };
         match action {
-            0 => {
-                if let Err(error) = queue.start() {
-                    app.notice = error.into();
-                    return 0;
-                }
-            }
             1 => queue.cancel(id),
             2 => queue.clear_finished(),
+            3 => queue.clear_all(),
             _ => return 0,
         }
         1
@@ -133,7 +147,9 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
         return -1;
     }
     boundary(|app| {
-        app.snapshot = app.queue.as_ref().map_or_else(Vec::new, Queue::snapshot);
+        let (snapshot, clearing) = app.queue.as_ref().map_or_else(
+            || (Vec::new(), false), Queue::snapshot_with_clearing);
+        app.snapshot = snapshot;
         let total = app.snapshot.len();
         let finished = app.snapshot.iter().filter(|j| j.phase.finished()).count();
         let published = app
@@ -146,11 +162,14 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .iter()
             .filter(|j| j.phase == Phase::Failed)
             .count();
-        let active = app
+         let active = clearing || app
             .snapshot
             .iter()
             .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
         let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {failed} failed   |   {} cancelled", finished - published - failed);
+        if clearing {
+            text.push_str("   |   Stopping and clearing all tasks…");
+        }
         if !app.notice.is_empty() {
             text.push_str("   |   ");
             text.push_str(&app.notice);
@@ -239,13 +258,15 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
-        let mut status = format!(
-            "{phase}  |  Source {}  |  Target ≤ {} MiB  |  {:?}  |  {} px max",
-            source_size(job),
-            job.settings.limit_mib(),
-            job.settings.codec(),
-            job.settings.max_long_edge()
-        );
+        let mut status = format!("{phase}  |  Source {}", source_size(job));
+        if let Some(settings) = job.settings {
+            status.push_str(&format!(
+                "  |  Target ≤ {} MiB  |  {:?}  |  {} px max",
+                settings.limit_mib(), settings.codec(), settings.max_long_edge()
+            ));
+        } else if job.phase == Phase::Waiting {
+            status.push_str("  |  Settings applied on Start");
+        }
         if job.retries > 0 {
             status.push_str(&format!("  |  Retries {}", job.retries));
         }
@@ -335,30 +356,18 @@ mod tests {
         let mut message = [0; 512];
         unsafe {
             assert_eq!(
-                orca_add_path(
-                    input.as_ptr().cast(),
-                    input.len(),
-                    size.as_ptr().cast(),
-                    2,
-                    1,
-                    1920
-                ),
+                orca_add_path(input.as_ptr().cast(), input.len()),
                 1
             );
             input.fill(0);
             assert_eq!(
-                orca_add_path(
-                    input.as_ptr().cast(),
-                    input.len(),
-                    size.as_ptr().cast(),
-                    2,
-                    1,
-                    1920
-                ),
+                orca_add_path(input.as_ptr().cast(), input.len()),
                 0
             );
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 1);
+            assert_eq!(orca_start(size.as_ptr().cast(), 0, 1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), -1, 1920), 0);
             let mut row = std::mem::MaybeUninit::<Row>::uninit();
             assert_eq!(orca_row(0, row.as_mut_ptr(), 1), -1);
             assert_eq!(orca_row(0, row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
@@ -369,6 +378,8 @@ mod tests {
                     .unwrap(),
                 name
             );
+            assert!(std::ffi::CStr::from_ptr(row.status.as_ptr()).to_str().unwrap()
+                .contains("Settings applied on Start"));
             assert_eq!(orca_action(1, row.id), 1);
             assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
             assert!(!std::ffi::CStr::from_ptr(message.as_ptr())
@@ -381,6 +392,9 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
+            assert_eq!(orca_action(3, 0), 1);
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
+            assert_eq!(count, 0);
             let mut small = [123; 3];
             assert!(write_text(small.as_mut_ptr(), small.len(), "🎬"));
             assert_eq!(small, [0, 123, 123]);

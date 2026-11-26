@@ -19,14 +19,14 @@ typedef struct {
     char status[512];
 } orca_job_row;
 
-extern int32_t orca_add_path(const char *path, size_t path_len,
-                            const char *size, size_t size_len, int32_t codec, uint32_t edge);
+extern int32_t orca_add_path(const char *path, size_t path_len);
+extern int32_t orca_start(const char *size, size_t size_len, int32_t codec, uint32_t edge);
 extern int32_t orca_action(uint32_t action, uint32_t id);
 extern int32_t orca_frame(char *out, size_t capacity, uint32_t *count);
 extern int32_t orca_row(uint32_t index, orca_job_row *out, size_t capacity);
 extern int32_t orca_detail(uint32_t index, char *out, size_t capacity);
 
-enum { START, CANCEL, CLEAR_FINISHED };
+enum { CANCEL = 1, CLEAR_FINISHED, CLEAR_ALL };
 static const uint32_t edges[] = { 3840, 2560, 1920, 1280 };
 
 typedef struct {
@@ -78,8 +78,7 @@ static void collect_drop(cui_ctx *ui, window_state *window) {
     window->callback_error = 0;
     for (int i = 0; i < count; ++i) {
         const char *path = cui_dropped_file(ui, i);
-        if (!path || orca_add_path(path, strlen(path), window->mib, strlen(window->mib),
-                                   window->codec, edges[window->resolution]) < 0) {
+        if (!path || orca_add_path(path, strlen(path)) < 0) {
             window->callback_error = 1;
         }
     }
@@ -151,7 +150,7 @@ static void frame(cui_ctx *ui, void *user) {
             cui_select(ui, "max-edge", resolutions, 4, &window->resolution,
                        .label = "Max. long edge", .width = CUI_FILL);
         }
-        cui_secondary(ui, "1 MiB = 1,048,576 bytes. Each file gets its own limit. Settings apply when files are added.");
+        cui_secondary(ui, "1 MiB = 1,048,576 bytes. Each file gets its own limit. Current settings apply to all queued files when Start is clicked.");
         cui_column(ui, .width = CUI_FILL, .pad = 10, .bg = CUI_COLOR_SURFACE_RAISED) {
             cui_text(ui, "Drop video files anywhere in this window (up to 64 per drop).");
         }
@@ -163,12 +162,23 @@ static void frame(cui_ctx *ui, void *user) {
         }
         cui_text(ui, busy < 0 || window->callback_error ? "Queue interface error." : status, .width = CUI_FILL);
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            if (cui_button(ui, "Start queued", .variant = CUI_BUTTON_PRIMARY, .disabled = !count))
-                action(ui, window, START, 0);
+            if (cui_button(ui, "Start queued", .variant = CUI_BUTTON_PRIMARY, .disabled = !count)) {
+                window->callback_error = orca_start(window->mib, strlen(window->mib),
+                    window->codec, edges[window->resolution]) < 0;
+                cui_request_redraw(ui);
+            }
             if (cui_button(ui, "Cancel all", .disabled = !count)) action(ui, window, CANCEL, 0);
             if (cui_button(ui, "Clear finished", .disabled = !count)) {
                 window->expanded = 0;
                 action(ui, window, CLEAR_FINISHED, 0);
+            }
+            if (cui_button(ui, "Clear All", .disabled = !count)) {
+                if (MessageBoxW(GetActiveWindow(),
+                    L"Stop all active tasks and clear the entire queue?\nSource files and saved outputs will not be deleted.",
+                    L"dotOrcA - Clear All", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                    window->expanded = 0;
+                    action(ui, window, CLEAR_ALL, 0);
+                }
             }
         }
     }
@@ -237,6 +247,9 @@ int orca_cui_self_test(void) {
         !strstr(status, "1 cancelled")) goto done;
     if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 1) goto done;
+    result = 14;
+    if (orca_action(CLEAR_ALL, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
+        count != 0) goto done;
     result = 0;
 done:
     cui_app_destroy(app);

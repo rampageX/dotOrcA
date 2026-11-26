@@ -83,7 +83,7 @@ pub struct Job {
     pub source: PathBuf,
     pub source_bytes: Option<u64>,
     pub source_size_pending: bool,
-    pub settings: Settings,
+    pub settings: Option<Settings>,
     pub phase: Phase,
     pub encoder: Option<&'static str>,
     pub progress_percent: Option<u8>,
@@ -108,6 +108,7 @@ struct State {
     entries: Vec<Entry>,
     next: u32,
     closing: bool,
+    clearing: bool,
 }
 
 #[derive(Default)]
@@ -144,6 +145,10 @@ impl Queue {
                     let mut state = background.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.closing = true;
                     background.size_ready.notify_one();
+                    if state.clearing {
+                        state.entries.clear();
+                        state.clearing = false;
+                    }
                     for entry in &mut state.entries {
                         if !entry.view.phase.finished() {
                             let job = Arc::make_mut(&mut entry.view);
@@ -166,13 +171,16 @@ impl Queue {
         Ok(Self { shared, worker })
     }
 
-    pub fn add(&self, source: &Path, settings: Settings) -> Result<u32, &'static str> {
+    pub fn add(&self, source: &Path) -> Result<u32, &'static str> {
         if !source.is_absolute() || source.file_stem().is_none() {
             return Err("Drop an absolute file path.");
         }
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing {
             return Err("Queue worker is unavailable.");
+        }
+        if state.clearing {
+            return Err("Wait for the active task to stop before adding files.");
         }
         if state.entries.len() >= CAPACITY {
             return Err("Queue is full. Clear finished jobs to add more.");
@@ -188,7 +196,7 @@ impl Queue {
                 source: source.into(),
                 source_bytes: None,
                 source_size_pending: true,
-                settings,
+                settings: None,
                 phase: Phase::Waiting,
                 encoder: None,
                 progress_percent: None,
@@ -208,14 +216,19 @@ impl Queue {
         Ok(id)
     }
 
-    pub fn start(&self) -> Result<(), &'static str> {
+    pub fn start(&self, settings: Settings) -> Result<(), &'static str> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing {
             return Err("Queue worker is unavailable.");
         }
+        if state.clearing {
+            return Err("Wait for Clear All to finish.");
+        }
         for entry in &mut state.entries {
             if entry.view.phase == Phase::Waiting {
-                Arc::make_mut(&mut entry.view).phase = Phase::Ready;
+                let job = Arc::make_mut(&mut entry.view);
+                job.settings = Some(settings);
+                job.phase = Phase::Ready;
             }
         }
         self.shared.ready.notify_one();
@@ -223,12 +236,15 @@ impl Queue {
     }
 
     pub fn snapshot(&self) -> Vec<Arc<Job>> {
+        self.snapshot_with_clearing().0
+    }
+
+    pub fn snapshot_with_clearing(&self) -> (Vec<Arc<Job>>, bool) {
         let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(&entry.view))
-            .collect()
+        (
+            state.entries.iter().map(|entry| Arc::clone(&entry.view)).collect(),
+            state.clearing,
+        )
     }
 
     pub fn cancel(&self, id: u32) {
@@ -242,7 +258,28 @@ impl Queue {
 
     pub fn clear_finished(&self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.entries.retain(|entry| !entry.view.phase.finished());
+        if !state.clearing {
+            state.entries.retain(|entry| !entry.view.phase.finished());
+        }
+    }
+
+    /// Stop all work without blocking the UI. The active worker clears the
+    /// queue only after the encoder has exited and its cleanup has returned.
+    pub fn clear_all(&self) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &mut state.entries {
+            cancel_entry(entry);
+        }
+        if state.entries.iter().all(|entry| entry.view.phase.finished()) {
+            state.entries.clear();
+            state.clearing = false;
+        } else {
+            state.clearing = true;
+        }
+    }
+
+    pub fn is_clearing(&self) -> bool {
+        self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).clearing
     }
 
     /// Called after the window closes. Running subprocesses are cancelled and
@@ -336,6 +373,11 @@ fn work(shared: &Shared, mut run: impl FnMut(&Job, &AtomicBool, &Updates<'_>)) {
             }
         };
         run(&job, &cancel, &Updates { shared, id: job.id });
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.clearing {
+            state.entries.clear();
+            state.clearing = false;
+        }
     }
 }
 
@@ -364,16 +406,16 @@ fn observe(job: &mut Job, event: Event<'_>) {
             if job.selection != Some(decision.selection) {
                 match decision.selection {
                     Selection::DefaultHardware(route) => {
-                        job.encoder = Some(route.encoder(job.settings.codec));
+                        job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
                     }
                     Selection::SoftwareFallback(reason) => {
                         job.encoder =
-                            Some(crate::decision::Route::Software.encoder(job.settings.codec));
+                            Some(crate::decision::Route::Software.encoder(job.settings.expect("started job").codec));
                         note(job, format!("Software fallback: {reason:?}"));
                     }
                     Selection::ProactiveSoftware => {
                         job.encoder =
-                            Some(crate::decision::Route::Software.encoder(job.settings.codec));
+                            Some(crate::decision::Route::Software.encoder(job.settings.expect("started job").codec));
                     }
                     Selection::NoRoute => {
                         job.encoder = None;
@@ -398,14 +440,14 @@ fn observe(job: &mut Job, event: Event<'_>) {
             detail,
             ..
         } => {
-            job.encoder = Some(route.encoder(job.settings.codec));
+            job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
             if result != crate::decision::CheckResult::Compatible {
                 note(job, format!("{} preflight: {detail}", job.encoder.unwrap()));
             }
         }
         Event::Encoding { route, .. } => {
             job.phase = Phase::Encoding;
-            job.encoder = Some(route.encoder(job.settings.codec));
+            job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
             job.progress_percent = Some(0);
         }
         Event::Validating => {
@@ -414,7 +456,7 @@ fn observe(job: &mut Job, event: Event<'_>) {
         }
         Event::RouteFailed { route, detail } => {
             job.encoder_error = Some(detail.to_owned());
-            note(job, format!("{} failed.", route.encoder(job.settings.codec)));
+            note(job, format!("{} failed.", route.encoder(job.settings.expect("started job").codec)));
         }
         Event::Oversize {
             measured,
@@ -489,9 +531,9 @@ fn encode(
                 destination: &destination,
                 ffmpeg: &ffmpeg,
                 ffprobe: &ffprobe,
-                limit_bytes: job.settings.limit_bytes,
-                codec: job.settings.codec,
-                max_long_edge: job.settings.max_long_edge,
+                limit_bytes: job.settings.expect("started job").limit_bytes,
+                codec: job.settings.expect("started job").codec,
+                max_long_edge: job.settings.expect("started job").max_long_edge,
                 timeout: Duration::from_secs(86_400),
             },
             detector,
@@ -521,7 +563,7 @@ fn encode(
                 job.elapsed = Some(out.elapsed);
                 job.eta = out.production_eta;
                 job.selection = Some(out.selection);
-                job.encoder = Some(out.route.encoder(job.settings.codec));
+                job.encoder = Some(out.route.encoder(job.settings.expect("started job").codec));
                 if let Err(error) = publication.learning {
                     note(
                         job,
@@ -614,9 +656,9 @@ mod tests {
         let path = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
         fs::write(&path, [0u8; 1234]).unwrap();
         let queue = Queue::spawn(|shared| work(shared, |_, _, _| unreachable!())).unwrap();
-        queue.add(&path, settings()).unwrap();
-        queue.add(&root.join("-missing 🎬.mp4"), settings()).unwrap();
-        queue.add(&root, settings()).unwrap();
+        queue.add(&path).unwrap();
+        queue.add(&root.join("-missing 🎬.mp4")).unwrap();
+        queue.add(&root).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let jobs = queue.snapshot();
@@ -637,10 +679,11 @@ mod tests {
     #[test]
     fn retry_and_encoder_error_keep_diagnostic() {
         let queue = Queue::spawn(|shared| work(shared, |_, _, _| unreachable!())).unwrap();
-        let id = queue.add(&std::env::temp_dir().join("test.mp4"), settings()).unwrap();
+        let id = queue.add(&std::env::temp_dir().join("test.mp4")).unwrap();
         let update = Updates { shared: &queue.shared, id };
         let error = format!("{}\nactual encoder error", "x".repeat(500));
         update.modify(|job| {
+            job.settings = Some(settings());
             job.progress_percent = Some(100);
             observe(job, Event::Oversize { measured: 2000000, next_video_bps: Some(100000) });
             assert_eq!(job.phase, Phase::Retrying);
@@ -649,6 +692,57 @@ mod tests {
             observe(job, Event::RouteFailed { route: crate::decision::Route::Software, detail: &error });
             assert_eq!(job.encoder_error.as_deref(), Some(error.as_str()));
         });
+        queue.shutdown();
+    }
+
+    #[test]
+    fn start_snapshots_settings_and_clear_all_waits_for_worker_cleanup() {
+        let (started, running) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let resume = Mutex::new(resume);
+        let queue = Queue::spawn(move |shared| {
+            work(shared, |job, cancel, update| {
+                started.send(job.settings.unwrap()).unwrap();
+                resume.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(cancel.load(Ordering::Acquire));
+                update.modify(|job| job.phase = Phase::Cancelled);
+            });
+        }).unwrap();
+        let path = std::env::temp_dir().join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        let first = queue.add(&path).unwrap();
+        queue.add(&path).unwrap();
+        assert!(queue.snapshot().iter().all(|j| j.settings.is_none()));
+        let chosen = Settings::new(30, Codec::Hevc, 1920).unwrap();
+        queue.start(chosen).unwrap();
+        let actual = running.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(actual.limit_mib(), 30);
+        assert_eq!(actual.codec(), Codec::Hevc);
+        assert_eq!(actual.max_long_edge(), 1920);
+        let later = queue.add(&path).unwrap();
+        assert!(queue.snapshot().iter().find(|j| j.id == later).unwrap().settings.is_none());
+        queue.start(settings()).unwrap();
+        let jobs = queue.snapshot();
+        assert_eq!(jobs[0].settings.unwrap().limit_mib(), 30);
+        assert_eq!(jobs[1].settings.unwrap().limit_mib(), 30);
+        assert_eq!(jobs[2].settings.unwrap().limit_mib(), 1);
+        queue.clear_all();
+        assert!(queue.is_clearing());
+        let jobs = queue.snapshot();
+        assert_eq!(jobs[0].id, first);
+        assert_eq!(jobs[0].phase, Phase::Cancelling);
+        assert!(jobs[1..].iter().all(|j| j.phase == Phase::Cancelled));
+        assert!(queue.add(&path).is_err());
+        assert!(queue.start(settings()).is_err());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.is_clearing() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(queue.snapshot().is_empty());
+        assert!(queue.add(&path).unwrap() > later);
+        queue.clear_all();
+        assert!(queue.snapshot().is_empty());
         queue.shutdown();
     }
 
@@ -671,11 +765,11 @@ mod tests {
         })
         .unwrap();
         let source = std::env::temp_dir().join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
-        let active = queue.add(&source, settings()).unwrap();
-        queue.start().unwrap();
+        let active = queue.add(&source).unwrap();
+        queue.start(settings()).unwrap();
         running.recv_timeout(Duration::from_secs(5)).unwrap();
         let snapshot = queue.snapshot();
-        let waiting = queue.add(&source, settings()).unwrap();
+        let waiting = queue.add(&source).unwrap();
         queue.cancel(waiting);
         queue.cancel(active);
         assert_eq!(snapshot[0].phase, Phase::Inspecting);
@@ -744,14 +838,14 @@ mod tests {
             });
         })
         .unwrap();
-        queue.add(&source, settings()).unwrap();
-        queue.add(&source, settings()).unwrap();
+        queue.add(&source).unwrap();
+        queue.add(&source).unwrap();
         queue
-            .add(&root.join("-missing 🎬.mp4"), settings())
+            .add(&root.join("-missing 🎬.mp4"))
             .unwrap();
-        let cancelled = queue.add(&root.join("cancelled.mp4"), settings()).unwrap();
+        let cancelled = queue.add(&root.join("cancelled.mp4")).unwrap();
         queue.cancel(cancelled);
-        queue.start().unwrap();
+        queue.start(settings()).unwrap();
 
         let jobs = await_finished(&queue);
         assert_eq!(jobs[0].phase, Phase::Published, "{:?}", jobs[0]);
@@ -774,6 +868,10 @@ mod tests {
             "{:?}",
             jobs[0]
         );
+        queue.clear_all();
+        assert!(queue.snapshot().is_empty());
+        assert!(source.exists());
+        assert!(jobs[0].output.as_ref().unwrap().is_file());
         queue.shutdown();
     }
 }
