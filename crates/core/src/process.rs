@@ -37,6 +37,11 @@ fn drain(mut r: impl Read, limit: usize) -> io::Result<Capture> {
 }
 pub fn run(req: &Request, cancelled: &AtomicBool) -> io::Result<Outcome> {
     if !req.exe.is_absolute() { return Err(io::Error::new(io::ErrorKind::InvalidInput,"absolute executable path required")); }
+    // Rust on Windows may implicitly invoke cmd.exe for .bat/.cmd. Permit PE .exe tools only.
+    #[cfg(windows)]
+    if !req.exe.extension().and_then(|e|e.to_str()).is_some_and(|e|e.eq_ignore_ascii_case("exe")) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,"Windows executable must have .exe extension; batch files are prohibited"));
+    }
     if cancelled.load(Ordering::Acquire) { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled before launch")); }
     let mut command = Command::new(&req.exe);
     command.args(&req.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -79,6 +84,16 @@ mod tests {
     #[test] fn bounded_capture() {
         let c=drain(&b"0123456789"[..],4).unwrap();
         assert_eq!(c.bytes,b"0123"); assert_eq!(c.discarded,6);
+    }
+    #[cfg(windows)]
+    #[test] fn shell_scripts_rejected() {
+        let p=std::env::current_exe().unwrap().with_extension("cmd");
+        let err=run(&Request::new(&p), &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(err.kind(),io::ErrorKind::InvalidInput);
+    }
+    #[test] fn prelaunch_cancelled() {
+        let p=std::env::current_exe().unwrap();
+        assert_eq!(run(&Request::new(&p), &AtomicBool::new(true)).unwrap_err().kind(),io::ErrorKind::Interrupted);
     }
     #[test] fn relative_exe_rejected() {
         assert_eq!(run(&Request::new(Path::new("ffmpeg")), &AtomicBool::new(false)).unwrap_err().kind(),io::ErrorKind::InvalidInput);
