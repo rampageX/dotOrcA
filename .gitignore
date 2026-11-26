@@ -1,0 +1,8 @@
+/target/
+/dist/
+/crates/gui/build/
+/config/
+/data/local/
+/logs/
+/work/
+*.exe

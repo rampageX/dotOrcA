@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/core", "crates/benchmark", "crates/gui", "crates/s00-probe"]
+default-members = ["crates/core", "crates/benchmark", "crates/s00-probe"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
