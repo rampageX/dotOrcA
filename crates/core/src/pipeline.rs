@@ -2,9 +2,9 @@
 use crate::{
     budget::{self, Codec, Plan},
     dataset::{Fingerprint, Observation, Outcome, Profile, Store},
-    decision::{self, CheckResult, Decision, Job, RequestCheck, Route, Selection},
+    decision::{self, CheckResult, Decision, Route, Selection},
     hardware::Detector,
-    media::{self, Hdr, MediaInfo, Stream},
+    media::{self, Hdr, MediaInfo},
     process::{self, Request, Stop},
 };
 use std::{
@@ -21,7 +21,6 @@ mod timeline;
 #[allow(unsafe_code)]
 mod windows;
 
-const SAMPLE_FRAMES: usize = 24;
 const MAX_REENCODES: usize = 2;
 
 #[derive(Debug)]
@@ -50,11 +49,14 @@ pub enum Error {
     Io(io::Error),
     Process(String),
     NoRoute,
+    HardwareRouteUnavailable,
     CapacityExceeded { limit: u64, measured: u64 },
 }
 
 #[derive(Debug)]
 pub enum Event<'a> {
+    Source(&'a MediaInfo),
+    Plan(&'a budget::Plan<'a>),
     Decision(&'a Decision<'a>),
     Preflight {
         route: Route,
@@ -201,9 +203,9 @@ fn encode_command(
     source: &MediaInfo,
     plan: &Plan<'_>,
     clock: timeline::Clock,
+    interlaced: bool,
     route: Route,
     rate: u64,
-    sample: bool,
     path: &Path,
 ) -> Request {
     let planar = route == Route::Software || route == Route::Amf;
@@ -220,8 +222,13 @@ fn encode_command(
     };
     // scale adjusts SAR to keep the original DAR. Explicit format conversion
     // is required because strict +pix_fmt disables auto-inserted converters.
+    let deinterlace = if interlaced {
+        "bwdif=mode=send_field:parity=auto:deint=all,"
+    } else {
+        ""
+    };
     let filter = format!(
-        "scale={}:{}:flags=lanczos{range},format={pix}",
+        "{deinterlace}scale={}:{}:flags=lanczos{range},format={pix}",
         plan.width, plan.height
     );
     let timescale = clock.den.to_string();
@@ -236,6 +243,8 @@ fn encode_command(
             "-loglevel",
             "error",
             "-xerror",
+            "-abort_on",
+            "empty_output",
             "-copyts",
             "-noautorotate",
             "-i",
@@ -243,7 +252,7 @@ fn encode_command(
         .args([source.path.as_os_str()])
         .args([
             "-map",
-            "0:v:0",
+            "0:V:0",
             "-c:v",
             route.encoder(plan.codec),
             "-vf",
@@ -314,14 +323,25 @@ fn encode_command(
             ]);
         }
     }
-    if sample {
-        cmd = cmd.args(["-frames:v", &SAMPLE_FRAMES.to_string(), "-an"]);
-    } else if !plan.audio_bps.is_empty() {
+    if !plan.audio_bps.is_empty() {
         cmd = cmd.args(["-map", "0:a", "-c:a", "aac"]);
         for (index, rate) in plan.audio_bps.iter().enumerate() {
             cmd = cmd.args([format!("-b:a:{index}"), rate.to_string()]);
         }
     }
+    for stream in &source.streams {
+        if stream.kind.as_deref() == Some("subtitle")
+            && matches!(
+                stream.codec.as_deref(),
+                Some("subrip" | "ass" | "ssa" | "mov_text" | "webvtt" | "text")
+            )
+        {
+            if let Some(index) = stream.index {
+                cmd = cmd.args(["-map", &format!("0:{index}")]);
+            }
+        }
+    }
+    cmd = cmd.args(["-c:s", "mov_text"]);
     cmd = cmd
         .args([
             "-map_metadata",
@@ -340,51 +360,11 @@ fn encode_command(
             "mp4",
         ])
         .args([path.as_os_str()]);
-    cmd.timeout = if sample {
-        request.timeout.min(Duration::from_secs(60))
-    } else {
-        request.timeout
-    };
+    cmd.timeout = request.timeout;
     cmd
 }
 
-enum AttemptError {
-    Route(String),
-    Task(Error),
-}
-
-impl From<Error> for AttemptError {
-    fn from(error: Error) -> Self {
-        Self::Task(error)
-    }
-}
-
-fn encoder_error(diagnostic: &str, encoder: &str) -> bool {
-    // FFmpeg prefixes encoder errors with [encoder @ ...] or
-    // [vost#0:0/encoder @ ...]. Require both the encoder and an error class.
-    diagnostic.lines().any(|line| {
-        let Some((component, message)) = line.split_once(" @ ") else {
-            return false;
-        };
-        let message = message.to_ascii_lowercase();
-        (component == format!("[{encoder}") || component.ends_with(&format!("/{encoder}")))
-            && [
-                "error",
-                "failed",
-                "unsupported",
-                "not supported",
-                "cannot",
-                "invalid",
-                "no capable",
-                "incompatible",
-                "unable",
-            ]
-            .iter()
-            .any(|needle| message.contains(needle))
-    }) || diagnostic.contains(&format!("Unknown encoder '{encoder}'"))
-}
-
-fn run_encoder(cmd: &Request, encoder: &str, cancel: &AtomicBool) -> Result<(), AttemptError> {
+fn run_encoder(cmd: &Request, encoder: &str, cancel: &AtomicBool) -> Result<(), Error> {
     finish_encoder(process::run(cmd, cancel), encoder, cancel)
 }
 
@@ -392,11 +372,13 @@ fn finish_encoder(
     result: io::Result<process::Outcome>,
     encoder: &str,
     cancel: &AtomicBool,
-) -> Result<(), AttemptError> {
+) -> Result<(), Error> {
     let out = result.map_err(|e| io_error(e, cancel))?;
     check_cancel(cancel)?;
     if out.stop == Stop::TimedOut {
-        return Err(Error::Process(format!("{encoder}: encoding deadline exceeded")).into());
+        return Err(Error::Process(format!(
+            "{encoder}: encoding deadline exceeded"
+        )));
     }
     let stderr = String::from_utf8_lossy(&out.stderr.bytes);
     if stderr
@@ -407,21 +389,18 @@ fn finish_encoder(
             .to_ascii_lowercase()
             .contains("not enough space on the disk")
     {
-        return Err(Error::DiskFull.into());
+        return Err(Error::DiskFull);
     }
     if out.status.success() {
         return Ok(());
     }
     let detail = format!("{encoder}: {}: {}", out.status, stderr);
-    if out.stderr.discarded == 0 && encoder_error(&stderr, encoder) {
-        return Err(AttemptError::Route(detail));
-    }
-    Err(Error::Process(detail).into())
+    Err(Error::Process(detail))
 }
 
 /// FFmpeg progress records are line oriented. Keep a fixed-size line buffer
 /// and discard long fields while continuing to drain the pipe.
-fn read_progress(mut input: impl Read, total: usize, report: &dyn Fn(u8)) {
+fn read_progress(mut input: impl Read, total: u64, report: &dyn Fn(u8)) {
     let mut chunk = [0; 4096];
     let mut line = [0; 64];
     let mut len = 0;
@@ -430,12 +409,13 @@ fn read_progress(mut input: impl Read, total: usize, report: &dyn Fn(u8)) {
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 if total != 0 && len <= line.len() {
-                    let frame = std::str::from_utf8(&line[..len])
+                    let timestamp = std::str::from_utf8(&line[..len])
                         .ok()
-                        .and_then(|s| s.strip_prefix("frame="))
-                        .and_then(|s| s.trim().parse::<usize>().ok());
-                    if let Some(frame) = frame {
-                        let percent = (100 * frame as u128 / total as u128).min(100) as u8;
+                        .and_then(|s| s.strip_prefix("out_time_us="))
+                        .and_then(|s| s.trim().parse::<u64>().ok());
+                    if let Some(timestamp) = timestamp {
+                        let percent =
+                            (100 * u128::from(timestamp) / u128::from(total)).min(99) as u8;
                         if percent > last {
                             last = percent;
                             report(percent);
@@ -451,39 +431,6 @@ fn read_progress(mut input: impl Read, total: usize, report: &dyn Fn(u8)) {
             }
         }
     }
-}
-
-fn display_matrix(stream: &Stream) -> Option<&serde_json::Value> {
-    stream.raw["side_data_list"]
-        .as_array()?
-        .iter()
-        .find(|item| item["side_data_type"].as_str() == Some("Display Matrix"))
-}
-
-fn video_info(source: &Stream, out: &Stream, plan: &Plan<'_>) -> Result<(), AttemptError> {
-    let codec = match plan.codec {
-        Codec::H264 => "h264",
-        Codec::Hevc => "hevc",
-        Codec::Av1 => "av1",
-    };
-    if out.codec.as_deref() != Some(codec)
-        || out.bit_depth != source.bit_depth
-        || out.width != Some(plan.width)
-        || out.height != Some(plan.height)
-        || out.hdr != source.hdr
-        || out.color_primaries != source.color_primaries
-        || out.color_transfer != source.color_transfer
-        || out.color_space != source.color_space
-        || out.color_range != source.color_range
-        || timeline::dar(source)? != timeline::dar(out)?
-        || display_matrix(source) != display_matrix(out)
-    {
-        return Err(AttemptError::Route(format!(
-            "output video constraints: {:?}",
-            out.raw
-        )));
-    }
-    Ok(())
 }
 
 fn remove(path: &Path, cancel: &AtomicBool) -> Result<(), Error> {
@@ -503,6 +450,18 @@ pub fn encode(
     observe: impl FnMut(Event<'_>),
 ) -> Result<Published, Error> {
     encode_inner(request, detector, cancel, observe, None, None)
+}
+
+/// GUI parallel mode uses the same production path without mixing
+/// concurrent timings into the serial learning dataset.
+pub fn encode_with_progress(
+    request: &EncodeRequest<'_>,
+    detector: &mut Detector,
+    cancel: &AtomicBool,
+    observe: impl FnMut(Event<'_>),
+    progress: Option<&(dyn Fn(u8) + Sync)>,
+) -> Result<Published, Error> {
+    encode_inner(request, detector, cancel, observe, None, progress)
 }
 
 #[derive(Debug)]
@@ -561,6 +520,7 @@ fn encode_inner(
     let source_meta = fs::metadata(&source_path).map_err(|e| io_error(e, cancel))?;
     let source =
         media::probe(request.ffprobe, &source_path, cancel).map_err(|e| io_error(e, cancel))?;
+    observe(Event::Source(&source));
     let plan = budget::plan(
         &source,
         request.limit_bytes,
@@ -568,6 +528,7 @@ fn encode_inner(
         request.max_long_edge,
     )
     .map_err(Error::Budget)?;
+    observe(Event::Plan(&plan));
     if plan.source.hdr == Hdr::DolbyVision || timeline::dynamic_hdr(&plan.source.raw.to_string()) {
         return Err(Error::UnsupportedDynamicHdr);
     }
@@ -591,208 +552,126 @@ fn encode_inner(
     let destination = directory.join(name);
     check_destination(&destination)?;
     unchanged(&source.path, &source_meta, cancel)?;
-    let clock = timeline::Clock::from_stream(plan.source)?;
+    let interlaced = matches!(
+        plan.source.raw["field_order"].as_str(),
+        Some("tt" | "bb" | "tb" | "bt")
+    );
+    let mut clock = timeline::Clock::from_stream(plan.source)?;
+    if interlaced {
+        clock.den = clock.den.saturating_mul(2);
+    }
     if clock.den > i32::MAX as u64 {
         return Err(Error::UnsupportedMedia(
             "video time base exceeds MP4 timescale",
         ));
     }
-    let original = timeline::scan(request, &source, clock, cancel)?;
-    original.require_continuous_audio()?;
-    let hardware = detector
-        .detect(request.ffmpeg, cancel)
-        .map_err(|e| io_error(e, cancel))?;
-    let stage = Stage::create(&directory).map_err(|e| io_error(e, cancel))?;
-    let sample = stage.0.join("preflight.mp4");
-    let output = stage.0.join("encoded.mp4");
-    let job = Job {
-        plan: &plan,
-        hardware: &hardware,
+    #[cfg(not(test))]
+    let hardware = detector.list_for_transcode(request.ffmpeg, cancel);
+    #[cfg(test)]
+    let hardware = if decision::fixture_fallback() {
+        detector.detect(request.ffmpeg, cancel)
+    } else {
+        detector.list_for_transcode(request.ffmpeg, cancel)
     };
-    let mut excluded = Vec::new();
-    let mut passed = Vec::new();
-    let mut rate = plan.video_bps;
-    let mut reencodes = 0;
-    let mut failed_preflights = Vec::new();
-    let mut failed_encodes = Vec::new();
+    let hardware = hardware.map_err(|e| io_error(e, cancel))?;
+    let decision = decision::decide(Ok(&plan), &hardware, &[], None).map_err(Error::Budget)?;
+    observe(Event::Decision(&decision));
+    let route = match decision.selection {
+        Selection::DefaultHardware(route) => route,
+        #[cfg(test)]
+        Selection::SoftwareFallback(_) => Route::Software,
+        _ => return Err(Error::HardwareRouteUnavailable),
+    };
 
-    loop {
+    let stage = Stage::create(&directory).map_err(|e| io_error(e, cancel))?;
+    let output = stage.0.join("encoded.mp4");
+    let mut rate = plan.video_bps;
+    for reencodes in 0..=MAX_REENCODES {
         check_cancel(cancel)?;
         unchanged(&source.path, &source_meta, cancel)?;
         check_destination(&destination)?;
-        let checks: Vec<_> = excluded.iter().chain(passed.iter()).copied().collect();
-        let decision =
-            decision::decide(Ok(&plan), &hardware, &checks, None).map_err(Error::Budget)?;
-        observe(Event::Decision(&decision));
-        if let Some(route) = decision.ready_route() {
-            observe(Event::Encoding {
-                route,
-                video_bps: rate,
-            });
-            let attempt_start = Instant::now();
-            let mut encode_elapsed = Duration::ZERO;
-            let result = (|| {
-                let mut command =
-                    encode_command(request, &source, &plan, clock, route, rate, false, &output);
-                let encoder = route.encoder(plan.codec);
-                if let Some(report) = progress {
-                    command
-                        .args
-                        .splice(0..0, ["-progress".into(), "pipe:1".into()]);
-                    let result = process::run_with_stdout(&command, cancel, |reader| {
-                        read_progress(reader, original.video_frames(), report);
-                    });
-                    finish_encoder(result.map(|(outcome, ())| outcome), encoder, cancel)?;
-                } else {
-                    run_encoder(&command, encoder, cancel)?;
-                }
-                encode_elapsed = attempt_start.elapsed();
-                observe(Event::Validating);
-                validate(request, &plan, clock, &original, &output, false, cancel)
-            })();
-            match result {
-                Ok(()) => {
-                    let bytes = fs::metadata(&output)
-                        .map_err(|e| io_error(e, cancel))?
-                        .len();
-                    if budget::fits(plan.limit_bytes, Some(bytes)) {
-                        unchanged(&source.path, &source_meta, cancel)?;
-                        publish(&output, &destination, cancel)?;
-                        let elapsed = start.elapsed();
-                        if let Some((tools, slot)) = tracking {
-                            let profile = Profile::new(
-                                &source,
-                                &plan,
-                                &hardware.inventory,
-                                route,
-                                rate,
-                                tools.clone(),
-                            );
-                            *slot = Some(Observation::published(
-                                profile,
-                                Outcome {
-                                    total: elapsed,
-                                    encode: encode_elapsed,
-                                    bytes,
-                                    retries: reencodes,
-                                    failed_preflights,
-                                    failed_encodes,
-                                    selection: decision.selection,
-                                },
-                            ));
-                        }
-                        return Ok(Published {
-                            path: destination,
-                            bytes,
-                            route,
-                            selection: decision.selection,
-                            video_bps: rate,
-                            elapsed,
-                            production_eta: None,
-                        });
-                    }
-                    let next = (reencodes < MAX_REENCODES)
-                        .then(|| retry_bitrate(&plan, rate, bytes))
-                        .flatten();
-                    observe(Event::Oversize {
-                        measured: bytes,
-                        next_video_bps: next,
-                    });
-                    rate = next.ok_or(Error::CapacityExceeded {
-                        limit: plan.limit_bytes,
-                        measured: bytes,
-                    })?;
-                    reencodes += 1;
-                    passed.clear();
-                }
-                Err(AttemptError::Route(detail)) => {
-                    failed_encodes.push(route.encoder(plan.codec));
-                    observe(Event::RouteFailed {
-                        route,
-                        detail: &detail,
-                    });
-                    excluded.push(RequestCheck {
-                        job,
-                        route,
-                        result: CheckResult::ExecutionFailed,
-                        evidence_id: "s06-production-validation-v1",
-                    });
-                    passed.clear();
-                }
-                Err(AttemptError::Task(error)) => return Err(error),
-            }
-            remove(&output, cancel)?;
-            continue;
-        }
-
-        let route = match decision.selection {
-            Selection::DefaultHardware(route) => route,
-            Selection::ProactiveSoftware | Selection::SoftwareFallback(_) => Route::Software,
-            Selection::NoRoute => return Err(Error::NoRoute),
-        };
-        let result = (|| {
-            run_encoder(
-                &encode_command(request, &source, &plan, clock, route, rate, true, &sample),
-                route.encoder(plan.codec),
-                cancel,
-            )?;
-            validate(request, &plan, clock, &original, &sample, true, cancel)
-        })();
-        remove(&sample, cancel)?;
-        let (result, detail) = match result {
-            Ok(()) => (
-                CheckResult::Compatible,
-                "source preflight matched output constraints".into(),
-            ),
-            Err(AttemptError::Route(detail)) => (CheckResult::Incompatible, detail),
-            Err(AttemptError::Task(error)) => return Err(error),
-        };
-        observe(Event::Preflight {
+        observe(Event::Encoding {
             route,
             video_bps: rate,
-            result,
-            detail: &detail,
         });
-        let check = RequestCheck {
-            job,
-            route,
-            result,
-            evidence_id: "s06-source-preflight-v1",
-        };
-        if result == CheckResult::Compatible {
-            passed.push(check);
+        let attempt_start = Instant::now();
+        let mut command = encode_command(
+            request, &source, &plan, clock, interlaced, route, rate, &output,
+        );
+        let encoder = route.encoder(plan.codec);
+        let result = if let Some(report) = progress {
+            command
+                .args
+                .splice(0..0, ["-progress".into(), "pipe:1".into()]);
+            let result = process::run_with_stdout(&command, cancel, |reader| {
+                read_progress(reader, plan.duration_us, report);
+            });
+            finish_encoder(result.map(|(outcome, ())| outcome), encoder, cancel)
         } else {
-            failed_preflights.push(route.encoder(plan.codec));
-            excluded.push(check);
+            run_encoder(&command, encoder, cancel)
+        };
+        if let Err(Error::Process(detail)) = &result {
+            observe(Event::RouteFailed { route, detail });
         }
+        result?;
+        let encode_elapsed = attempt_start.elapsed();
+        observe(Event::Validating);
+        let bytes = fs::metadata(&output)
+            .map_err(|e| io_error(e, cancel))?
+            .len();
+        if bytes == 0 {
+            return Err(Error::Process("FFmpeg produced an empty file".into()));
+        }
+        if budget::fits(plan.limit_bytes, Some(bytes)) {
+            unchanged(&source.path, &source_meta, cancel)?;
+            publish(&output, &destination, cancel)?;
+            let elapsed = start.elapsed();
+            if let Some((tools, slot)) = tracking {
+                let profile = Profile::new(
+                    &source,
+                    &plan,
+                    &hardware.inventory,
+                    route,
+                    rate,
+                    tools.clone(),
+                );
+                *slot = Some(Observation::published(
+                    profile,
+                    Outcome {
+                        total: elapsed,
+                        encode: encode_elapsed,
+                        bytes,
+                        retries: reencodes,
+                        failed_preflights: Vec::new(),
+                        failed_encodes: Vec::new(),
+                        selection: decision.selection,
+                    },
+                ));
+            }
+            return Ok(Published {
+                path: destination,
+                bytes,
+                route,
+                selection: decision.selection,
+                video_bps: rate,
+                elapsed,
+                production_eta: None,
+            });
+        }
+        let next = (reencodes < MAX_REENCODES)
+            .then(|| retry_bitrate(&plan, rate, bytes))
+            .flatten();
+        observe(Event::Oversize {
+            measured: bytes,
+            next_video_bps: next,
+        });
+        rate = next.ok_or(Error::CapacityExceeded {
+            limit: plan.limit_bytes,
+            measured: bytes,
+        })?;
+        remove(&output, cancel)?;
     }
-}
-
-fn validate(
-    request: &EncodeRequest<'_>,
-    plan: &Plan<'_>,
-    clock: timeline::Clock,
-    original: &timeline::Summary,
-    path: &Path,
-    sample: bool,
-    cancel: &AtomicBool,
-) -> Result<(), AttemptError> {
-    let media = media::probe(request.ffprobe, path, cancel).map_err(|e| io_error(e, cancel))?;
-    let expected_audio = if sample { 0 } else { plan.audio_bps.len() };
-    if media.streams.len() != 1 + expected_audio
-        || media.streams.first().and_then(|s| s.kind.as_deref()) != Some("video")
-        || media.streams[1..]
-            .iter()
-            .any(|s| s.kind.as_deref() != Some("audio") || s.codec.as_deref() != Some("aac"))
-        || media.size_bytes == Some(0)
-    {
-        return Err(AttemptError::Route("invalid output stream layout".into()));
-    }
-    video_info(plan.source, &media.streams[0], plan)?;
-    let observed = timeline::scan(request, &media, clock, cancel)?;
-    original
-        .compare(&observed, sample)
-        .map_err(AttemptError::Route)
+    unreachable!("the last capacity retry returns a result")
 }
 
 #[cfg(test)]

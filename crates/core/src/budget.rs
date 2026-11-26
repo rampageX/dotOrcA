@@ -42,8 +42,8 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
                 let channels = stream.channels.filter(|n| *n > 0).ok_or(Error::UnknownChannels)?;
                 audio_bps.push(channels.checked_mul(64_000).ok_or(Error::RateOverflow)?);
             }
-            // Unbudgeted attachments, subtitles, alternate video, or unknown data need mapping first.
-            _ => return Err(Error::UnsupportedStreams),
+            // Production maps the first non-cover video and all audio tracks.
+            _ => {}
         }
     }
     let source = video.ok_or(Error::UnsupportedStreams)?;
@@ -65,22 +65,27 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
     let video_bps = u64::try_from(rate).map_err(|_| Error::RateOverflow)?;
     if video_bps == 0 { return Err(Error::InsufficientCapacity); }
 
-    // Prefer detail at source cadence. 1/20 bit per pixel per frame is a
-    // policy threshold, not a measured quality floor or a codec ranking.
+    // Preserve source geometry whenever it meets the user's maximum.
+    // Only oversized sources enter the existing downscale heuristic.
+    // 1/20 bit per pixel per frame is a heuristic, not a quality guarantee.
     let long = w.max(h);
-    let cap = long.min(u64::from(max_long_edge));
-    let mut edges = std::iter::once(cap).chain([3840,2560,1920,1280,960,640,426,256].into_iter().filter(|&n| n < cap));
+    let cap = u64::from(max_long_edge);
     let rate = source.avg_rate.filter(|r| r.numerator > 0 && r.denominator > 0);
-    let (width,height) = loop {
-        let edge = edges.next().ok_or(Error::InsufficientCapacity)?;
-        let scale = |side| ((u128::from(side) * u128::from(edge) / u128::from(long)) as u64) & !1;
-        let (x,y) = (scale(w),scale(h));
-        if x < 2 || y < 2 { return Err(Error::UnknownGeometry); }
-        if rate.is_none_or(|r| {
-            let needed = u128::from(x) * u128::from(y) * u128::from(r.numerator);
-            let available = (u128::from(video_bps) * u128::from(r.denominator)).saturating_mul(20);
-            needed <= available
-        }) { break (x,y); }
+    let (width,height) = if long <= cap {
+        (w,h)
+    } else {
+        let mut edges = std::iter::once(cap).chain([3840,2560,1920,1280,960,640,426,256].into_iter().filter(|&n| n < cap));
+        loop {
+            let edge = edges.next().ok_or(Error::InsufficientCapacity)?;
+            let scale = |side| ((u128::from(side) * u128::from(edge) / u128::from(long)) as u64) & !1;
+            let (x,y) = (scale(w),scale(h));
+            if x < 2 || y < 2 { return Err(Error::UnknownGeometry); }
+            if rate.is_none_or(|r| {
+                let needed = u128::from(x) * u128::from(y) * u128::from(r.numerator);
+                let available = (u128::from(video_bps) * u128::from(r.denominator)).saturating_mul(20);
+                needed <= available
+            }) { break (x,y); }
+        }
     };
     Ok(Plan { limit_bytes: limit, duration_us: duration, audio_bps, audio_bytes,
         mux_reserve_bytes: mux, video_bytes, video_bps, codec, width, height,
@@ -152,7 +157,8 @@ mod tests {
         assert_eq!(plan(&m,1,Codec::Av1,1920).unwrap_err(),Error::InsufficientCapacity);
         m.streams.truncate(1);
         let p = plan(&m,2_000_000,Codec::Hevc,4096).unwrap();
-        assert!(p.height < 1920 && p.audio_bytes==0);
+        assert_eq!((p.width,p.height),(1080,1920));
+        assert_eq!(p.audio_bytes,0);
         m.duration_us=None;
         assert_eq!(plan(&m,u64::MAX,Codec::Av1,1920).unwrap_err(),Error::UnknownDuration);
         m.duration_us=Some(1);
@@ -163,6 +169,32 @@ mod tests {
         m.streams[0].avg_rate=None;
         assert!(plan(&m,u64::MAX,Codec::H264,4096).unwrap().source_rate.is_none());
     }
+    #[test]
+    fn preserve_geometry_within_cap_even_when_bpp_is_low() {
+        let mut m = media();
+        m.streams.truncate(1);
+        let video = &mut m.streams[0];
+        video.width = Some(3840);
+        video.height = Some(2160);
+        video.avg_rate = Some(Rational{numerator:30,denominator:1});
+        m.duration_us = Some(238_570_000);
+        for codec in [Codec::H264,Codec::Hevc,Codec::Av1] {
+            for cap in [3840,4096] {
+                let p = plan(&m,251_382_000,codec,cap).unwrap();
+                assert!(p.video_bps < 12_441_600);
+                assert_eq!((p.width,p.height),(3840,2160));
+            }
+            let p = plan(&m,251_382_000,codec,2560).unwrap();
+            assert_eq!((p.width,p.height),(2560,1440));
+            let p = plan(&m,10_000_000,codec,2560).unwrap();
+            assert!(p.width < 2560);
+        }
+        m.streams[0].width = Some(1071);
+        m.streams[0].height = Some(1920);
+        let p = plan(&m,2_000_000,Codec::Hevc,1920).unwrap();
+        assert_eq!((p.width,p.height),(1071,1920));
+    }
+
     #[test]
     fn historical_budget_boundary() {
         let db=Database::bundled().unwrap();

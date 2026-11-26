@@ -19,18 +19,20 @@ typedef struct {
     char status[512];
 } orca_job_row;
 
-extern int32_t orca_add_path(const char *path, size_t path_len,
-                            const char *size, size_t size_len, int32_t codec, uint32_t edge);
+extern int32_t orca_add_path(const char *path, size_t path_len);
+extern int32_t orca_start(const char *size, size_t size_len, int32_t mode, int32_t codec, uint32_t edge);
 extern int32_t orca_action(uint32_t action, uint32_t id);
 extern int32_t orca_frame(char *out, size_t capacity, uint32_t *count);
 extern int32_t orca_row(uint32_t index, orca_job_row *out, size_t capacity);
 extern int32_t orca_detail(uint32_t index, char *out, size_t capacity);
 
-enum { START, CANCEL, CLEAR_FINISHED };
+enum { CANCEL = 1, CLEAR_FINISHED, CLEAR_ALL, RESET };
 static const uint32_t edges[] = { 3840, 2560, 1920, 1280 };
 
 typedef struct {
     char mib[24];
+    char percent[24];
+    int target_mode;
     int codec;
     int resolution;
     uint32_t expanded;
@@ -38,6 +40,8 @@ typedef struct {
     int font_tried;
     int font_ok;
     int callback_error;
+    int icon_tried;
+    bool confirm_clear_all;
 } window_state;
 
 /* No font bundled: read a local Windows font by a wide filesystem path.
@@ -78,8 +82,7 @@ static void collect_drop(cui_ctx *ui, window_state *window) {
     window->callback_error = 0;
     for (int i = 0; i < count; ++i) {
         const char *path = cui_dropped_file(ui, i);
-        if (!path || orca_add_path(path, strlen(path), window->mib, strlen(window->mib),
-                                   window->codec, edges[window->resolution]) < 0) {
+        if (!path || orca_add_path(path, strlen(path)) < 0) {
             window->callback_error = 1;
         }
     }
@@ -105,7 +108,12 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
                 window->expanded = window->expanded == job.id ? 0 : job.id;
                 cui_request_redraw(ui);
             }
-            if (cui_button(ui, "Cancel", .disabled = (job.flags & 1u) == 0)) {
+            if (job.flags & 2u) {
+                if (cui_button(ui, "Reset")) {
+                    if (window->expanded == job.id) window->expanded = 0;
+                    action(ui, window, RESET, job.id);
+                }
+            } else if (cui_button(ui, "Cancel", .disabled = (job.flags & 1u) == 0)) {
                 action(ui, window, CANCEL, job.id);
             }
         }
@@ -124,10 +132,30 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
     cui_pop_id(ui);
 }
 
+/* Shared resource handles remain valid for the life of the module. */
+static int apply_window_icon(HWND hwnd) {
+    if (!hwnd) return 0;
+    HINSTANCE module = GetModuleHandleW(NULL);
+    HICON big = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    HICON small_icon = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    if (!big || !small_icon) return 0;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);
+    return SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0) == (LRESULT)big &&
+           SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0) == (LRESULT)small_icon;
+}
+
 static void frame(cui_ctx *ui, void *user) {
+    static const char *modes[] = { "Fixed size", "% of source" };
     static const char *codecs[] = { "H.264", "HEVC", "AV1" };
     static const char *resolutions[] = { "3840 px", "2560 px", "1920 px", "1280 px" };
     window_state *window = (window_state *)user;
+    if (!window->icon_tried) {
+        window->icon_tried = 1;
+        apply_window_icon((HWND)cui_app_native_window(NULL));
+    }
     if (window->font_pending && !window->font_tried) {
         window->font_tried = 1;
         window->font_ok = load_system_cjk(ui);
@@ -136,7 +164,7 @@ static void frame(cui_ctx *ui, void *user) {
         cui_request_wakeup(ui, 0.05f);
     }
 
-    collect_drop(ui, window);
+    if (!window->confirm_clear_all) collect_drop(ui, window);
     uint32_t count = 0;
     char status[768] = {0};
     int busy = orca_frame(status, sizeof(status), &count);
@@ -144,14 +172,23 @@ static void frame(cui_ctx *ui, void *user) {
                .bg = CUI_COLOR_BACKGROUND) {
         cui_heading(ui, "dotOrcA", 1);
         cui_row(ui, .width = CUI_FILL, .gap = 12) {
-            cui_input(ui, "mib", window->mib, sizeof(window->mib),
-                      .label = "Capacity per file", .suffix = "MiB", .width = CUI_FILL);
+            cui_select(ui, "target-mode", modes, 2, &window->target_mode,
+                       .label = "Capacity mode", .width = CUI_FILL);
+            if (window->target_mode == 0) {
+                cui_input(ui, "mib", window->mib, sizeof(window->mib),
+                          .label = "Capacity per file", .suffix = "MiB", .width = CUI_FILL);
+            } else {
+                cui_input(ui, "percent", window->percent, sizeof(window->percent),
+                          .label = "Output / source", .suffix = "%", .width = CUI_FILL);
+            }
             cui_select(ui, "codec", codecs, 3, &window->codec,
                        .label = "Output codec", .width = CUI_FILL);
             cui_select(ui, "max-edge", resolutions, 4, &window->resolution,
                        .label = "Max. long edge", .width = CUI_FILL);
         }
-        cui_secondary(ui, "1 MiB = 1,048,576 bytes. Each file gets its own limit. Settings apply when files are added.");
+        cui_secondary(ui, window->target_mode == 0
+            ? "Files already within the MiB limit are skipped. Settings apply on Start."
+            : "50% means half the original file size. Each file gets its own limit. Settings apply on Start.");
         cui_column(ui, .width = CUI_FILL, .pad = 10, .bg = CUI_COLOR_SURFACE_RAISED) {
             cui_text(ui, "Drop video files anywhere in this window (up to 64 per drop).");
         }
@@ -163,12 +200,37 @@ static void frame(cui_ctx *ui, void *user) {
         }
         cui_text(ui, busy < 0 || window->callback_error ? "Queue interface error." : status, .width = CUI_FILL);
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            if (cui_button(ui, "Start queued", .variant = CUI_BUTTON_PRIMARY, .disabled = !count))
-                action(ui, window, START, 0);
+            if (cui_button(ui, "Start queued", .variant = CUI_BUTTON_PRIMARY, .disabled = !count)) {
+                const char *value = window->target_mode == 0 ? window->mib : window->percent;
+                window->callback_error = orca_start(value, strlen(value), window->target_mode,
+                    window->codec, edges[window->resolution]) < 0;
+                cui_request_redraw(ui);
+            }
             if (cui_button(ui, "Cancel all", .disabled = !count)) action(ui, window, CANCEL, 0);
             if (cui_button(ui, "Clear finished", .disabled = !count)) {
                 window->expanded = 0;
                 action(ui, window, CLEAR_FINISHED, 0);
+            }
+            if (cui_button(ui, "Clear All", .disabled = !count)) {
+                window->confirm_clear_all = true;
+                cui_request_redraw(ui);
+            }
+        }
+    }
+    if (window->confirm_clear_all) {
+        cui_dialog(ui, "Clear All", &window->confirm_clear_all,
+                   .width = 440, .description = "Stop active tasks and clear the entire queue?") {
+            cui_text(ui, "Source files and saved outputs will not be deleted.", .width = CUI_FILL);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "Keep tasks")) {
+                    window->confirm_clear_all = false;
+                    cui_request_redraw(ui);
+                }
+                if (cui_button(ui, "Clear All", .variant = CUI_BUTTON_PRIMARY)) {
+                    window->confirm_clear_all = false;
+                    window->expanded = 0;
+                    action(ui, window, CLEAR_ALL, 0);
+                }
             }
         }
     }
@@ -184,7 +246,7 @@ static cui_app_desc description(void) {
 }
 
 int orca_cui_run(void) {
-    window_state window = { .mib = "100", .codec = 1, .resolution = 0 };
+    window_state window = { .mib = "100", .percent = "50", .codec = 1, .resolution = 0 };
     cui_app_desc desc = description();
     return cui_app_run(&desc, frame, &window);
 }
@@ -217,8 +279,13 @@ int orca_cui_self_test(void) {
     desc.hidden = true;
     cui_app *app = cui_app_create(&desc);
     if (!app) return 10;
-    int result = 11;
-    window_state window = { .mib = "100", .codec = 1, .font_pending = 1, .font_tried = 1 };
+    int result = 15;
+    if (!apply_window_icon((HWND)cui_app_native_window(app))) {
+        cui_app_destroy(app);
+        return result;
+    }
+    result = 11;
+    window_state window = { .mib = "100", .percent = "50", .codec = 1, .font_pending = 1, .font_tried = 1, .icon_tried = 1 };
     if (!cui_app_is_software(app) || !cui_app_frame(app)) goto done;
     cui_ctx *ui = cui_app_ui(app);
     frame(ui, &window);
@@ -228,15 +295,29 @@ int orca_cui_self_test(void) {
     uint32_t count = 0;
     orca_job_row a, b;
     result = 12;
-    if (orca_frame(status, sizeof(status), &count) != 0 || count != 2 ||
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 2 ||
         orca_row(0, &a, sizeof(a)) != 1 || orca_row(1, &b, sizeof(b)) != 1 ||
         strcmp(a.name, "小K 的鹅腿坟场 & (黑洞) ^ % !.avi") ||
         strcmp(b.name, "-movie 🎬.mp4")) goto done;
     result = 13;
-    if (orca_action(CANCEL, b.id) != 1 || orca_frame(status, sizeof(status), &count) != 0 ||
+    if (orca_action(CANCEL, b.id) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         !strstr(status, "1 cancelled")) goto done;
-    if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) != 0 ||
+    if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 1) goto done;
+    result = 16;
+    /* Render the modal in the normal frame path; opening/dismissing it
+       must not clear the queue. The positive action is covered below. */
+    window.confirm_clear_all = true;
+    if (!cui_app_frame(app)) goto done;
+    frame(ui, &window);
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 1) goto done;
+    window.confirm_clear_all = false;
+    if (!cui_app_frame(app)) goto done;
+    frame(ui, &window);
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 1) goto done;
+    result = 14;
+    if (orca_action(CLEAR_ALL, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
+        count != 0) goto done;
     result = 0;
 done:
     cui_app_destroy(app);

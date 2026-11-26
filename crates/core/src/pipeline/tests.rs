@@ -56,6 +56,7 @@ fn run_fixture(tool: &Path, args: &[&str], path: &Path) {
 #[test]
 #[ignore = "S06 CI supplies external FFmpeg and FFprobe"]
 fn production_special_path_vfr_audio_and_hdr() {
+    decision::allow_fixture_fallback();
     let root = test_root();
     let ffmpeg = tool("DOTORCA_TEST_FFMPEG");
     let ffprobe = tool("DOTORCA_TEST_FFPROBE");
@@ -128,7 +129,7 @@ fn production_special_path_vfr_audio_and_hdr() {
         json["records"][0]["profile"]["encoder"],
         first.route.encoder(request.codec)
     );
-    assert_eq!(json["records"][0]["source"], "s06-verified-publication-v1");
+    assert_eq!(json["records"][0]["source"], "s09-ffmpeg-publication-v1");
     assert!(!String::from_utf8_lossy(&history).contains("鹅腿坟场"));
     assert!(first.bytes <= request.limit_bytes && first.bytes > 0);
     let cancel_out = root.0.join("cancelled.mp4");
@@ -241,7 +242,7 @@ fn production_special_path_vfr_audio_and_hdr() {
             "-c:v",
             "libx265",
             "-x265-params",
-            "pools=1:frame-threads=1:log-level=none:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400",
+            "pools=1:frame-threads=1:log-level=none:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400",
             "-color_trc",
             "smpte2084",
             "-color_primaries",
@@ -251,18 +252,14 @@ fn production_special_path_vfr_audio_and_hdr() {
         ],
         &pq,
     );
-    let info = media::probe(&ffprobe, &pq, &cancel).unwrap();
-    let clock = timeline::Clock::from_stream(&info.streams[0]).unwrap();
-    assert_eq!(
-        timeline::scan(&request, &info, clock, &cancel)
-            .unwrap()
-            .static_hdr_count(),
-        2
-    );
     request.source = &pq;
     request.destination = &pq_out;
     let first = encode(&request, &mut detector, &cancel, logs).unwrap();
     assert!(first.bytes <= request.limit_bytes);
+
+    let pq_result = media::probe(&ffprobe, &pq_out, &cancel).unwrap();
+    assert_eq!(pq_result.streams[0].hdr, Hdr::Pq);
+    assert_eq!(pq_result.streams[0].bit_depth, Some(10));
 
     let av1_out = root.0.join("AV1 HLG output.mp4");
     request.source = &hdr;
@@ -270,6 +267,48 @@ fn production_special_path_vfr_audio_and_hdr() {
     request.codec = Codec::Av1;
     let first = encode(&request, &mut detector, &cancel, logs).unwrap();
     assert!(first.bytes <= request.limit_bytes);
+
+    let interlaced = root.0.join("50 fields with subtitles.mkv");
+    let subtitles = root.0.join("captions.srt");
+    fs::write(&subtitles, "1\n00:00:00,200 --> 00:00:01,800\nTest text\n").unwrap();
+    let fixture = Request::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=50:duration=2",
+            "-i",
+        ])
+        .args([subtitles.as_os_str()])
+        .args([
+            "-vf",
+            "tinterlace=interleave_top",
+            "-c:v",
+            "mpeg2video",
+            "-flags:v",
+            "+ilme+ildct",
+            "-c:s",
+            "srt",
+        ])
+        .args([interlaced.as_os_str()]);
+    let fixture = process::run(&fixture, &cancel).unwrap();
+    assert!(fixture.status.success(), "{:?}", fixture.stderr);
+    let progressive = root.0.join("50p with subtitles.mp4");
+    request.source = &interlaced;
+    request.destination = &progressive;
+    request.codec = Codec::H264;
+    request.limit_bytes = 1_048_576;
+    encode(&request, &mut detector, &cancel, |event| {
+        assert!(!matches!(event, Event::Preflight { .. }));
+    })
+    .unwrap();
+    let converted = media::probe(&ffprobe, &progressive, &cancel).unwrap();
+    assert_eq!(converted.streams[0].raw["field_order"], "progressive");
+    assert_eq!(converted.streams[0].avg_rate.unwrap().numerator, 50);
+    assert_eq!(converted.streams[0].avg_rate.unwrap().denominator, 1);
+    assert_eq!(converted.streams[1].codec.as_deref(), Some("mov_text"));
 
     #[cfg(target_os = "linux")]
     {
@@ -291,7 +330,7 @@ fn production_special_path_vfr_audio_and_hdr() {
         ]);
         assert!(matches!(
             run_encoder(&full, "libx264", &cancel),
-            Err(AttemptError::Task(Error::DiskFull))
+            Err(Error::DiskFull)
         ));
     }
     #[cfg(windows)]
@@ -337,5 +376,5 @@ fn production_special_path_vfr_audio_and_hdr() {
         fs::remove_file(&filler).unwrap();
         assert_eq!(fs::read_dir(&full_root).unwrap().count(), 0);
     }
-    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 7);
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 10);
 }

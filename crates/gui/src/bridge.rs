@@ -2,7 +2,7 @@
 //! one immutable snapshot per frame. No worker calls back into C.
 use orca_core::{
     budget::Codec,
-    queue::{Job, Phase, Queue, Settings},
+    queue::{Job, Phase, Queue, Settings, Target},
 };
 use std::{cell::RefCell, ffi::c_char, path::Path, ptr, sync::Arc};
 
@@ -73,29 +73,53 @@ unsafe fn write_text(out: *mut c_char, capacity: usize, text: &str) -> bool {
 pub unsafe extern "C" fn orca_add_path(
     path: *const c_char,
     path_len: usize,
-    size: *const c_char,
-    size_len: usize,
-    codec: i32,
-    edge: u32,
 ) -> i32 {
     boundary(|app| {
         let added = (|| {
             let path = unsafe { utf8(path, path_len, 131_072) }?;
-            let mib = unsafe { utf8(size, size_len, 24) }?
+            app.queue()?.add(Path::new(path))?;
+            Ok::<_, String>(())
+        })();
+        match added {
+            Ok(()) => 1,
+            Err(error) => {
+                app.notice = error;
+                0
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn orca_start(
+    size: *const c_char,
+    size_len: usize,
+    mode: i32,
+    codec: i32,
+    edge: u32,
+) -> i32 {
+    boundary(|app| {
+        app.notice.clear();
+        let started = (|| {
+            let value = unsafe { utf8(size, size_len, 24) }?
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| "Enter the target as whole MiB.")?;
+                .map_err(|_| "Enter a whole number for the target.")?;
             let codec = match codec {
                 0 => Codec::H264,
                 1 => Codec::Hevc,
                 2 => Codec::Av1,
                 _ => return Err("Invalid output codec.".into()),
             };
-            let settings = Settings::new(mib, codec, edge)?;
-            app.queue()?.add(Path::new(path), settings)?;
+            let settings = match mode {
+                0 => Settings::new(value, codec, edge)?,
+                1 => Settings::percentage(value, codec, edge)?,
+                _ => return Err("Invalid capacity mode.".into()),
+            };
+            app.queue()?.start(settings)?;
             Ok::<_, String>(())
         })();
-        match added {
+        match started {
             Ok(()) => 1,
             Err(error) => {
                 app.notice = error;
@@ -113,14 +137,13 @@ pub extern "C" fn orca_action(action: u32, id: u32) -> i32 {
             return 0;
         };
         match action {
-            0 => {
-                if let Err(error) = queue.start() {
-                    app.notice = error.into();
-                    return 0;
-                }
-            }
             1 => queue.cancel(id),
             2 => queue.clear_finished(),
+            3 => queue.clear_all(),
+            4 => if let Err(error) = queue.reset(id) {
+                app.notice = error.into();
+                return 0;
+            },
             _ => return 0,
         }
         1
@@ -133,7 +156,9 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
         return -1;
     }
     boundary(|app| {
-        app.snapshot = app.queue.as_ref().map_or_else(Vec::new, Queue::snapshot);
+        let (snapshot, clearing, slots) = app.queue.as_ref().map_or_else(
+            || (Vec::new(), false, 1), Queue::snapshot_status);
+        app.snapshot = snapshot;
         let total = app.snapshot.len();
         let finished = app.snapshot.iter().filter(|j| j.phase.finished()).count();
         let published = app
@@ -141,16 +166,20 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             .iter()
             .filter(|j| j.phase == Phase::Published)
             .count();
+        let skipped = app.snapshot.iter().filter(|j| j.phase == Phase::Skipped).count();
         let failed = app
             .snapshot
             .iter()
             .filter(|j| j.phase == Phase::Failed)
             .count();
-        let active = app
+         let active = clearing || app
             .snapshot
             .iter()
-            .any(|j| !j.phase.finished() && j.phase != Phase::Waiting);
-        let mut text = format!("{finished}/{total} finished   |   {published} saved   |   {failed} failed   |   {} cancelled", finished - published - failed);
+            .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
+        let mut text = format!("{finished}/{total} finished   |   {slots} slots   |   {published} saved   |   {skipped} skipped   |   {failed} failed   |   {} cancelled", finished - published - skipped - failed);
+        if clearing {
+            text.push_str("   |   Stopping and clearing all tasks…");
+        }
         if !app.notice.is_empty() {
             text.push_str("   |   ");
             text.push_str(&app.notice);
@@ -163,10 +192,42 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
     })
 }
 
+fn readable_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    for (unit, label) in [(TIB, "TiB"), (GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
+        if bytes >= unit {
+            return format!("{:.2} {label}", bytes as f64 / unit as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
+fn source_size(job: &Job) -> String {
+    if job.source_size_pending {
+        "reading…".into()
+    } else {
+        job.source_bytes.map_or_else(|| "unknown".into(), readable_size)
+    }
+}
+
+fn diagnostic_preview(error: &str) -> String {
+    // Keep the beginning and end of the captured diagnostic, rather than
+    // discarding the actual error after a long FFmpeg prefix.
+    if error.len() <= 16 * 1024 {
+        return error.to_owned();
+    }
+    let first = error.floor_char_boundary(4096);
+    let last = error.ceil_char_boundary(error.len() - 12 * 1024);
+    format!("{}\n[Diagnostic shortened in UI; see task log.]\n{}", &error[..first], &error[last..])
+}
+
 #[repr(C)]
 pub struct Row {
     id: u32,
-    // Bit 0: can cancel.
+    // Bit 0: can cancel; bit 1: terminal row (can reset).
     flags: u32,
     percent: i32,
     name: [c_char; 1024],
@@ -184,7 +245,7 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
         };
         let mut row = Row {
             id: job.id,
-            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling),
+            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling) | (u32::from(job.phase.finished()) << 1),
             percent: job.progress_percent.map_or(-1, i32::from),
             name: [0; 1024],
             status: [0; 512],
@@ -201,24 +262,47 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Preflight => "Checking route",
             Phase::Encoding => "Encoding",
             Phase::Validating => "Validating output",
-            Phase::Retrying => "Adjusting bitrate",
+            Phase::Retrying => "Retrying (capacity)",
             Phase::Cancelling => "Cancelling",
             Phase::Published => "Saved",
+            Phase::Skipped => "Skipped",
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
-        let mut status = format!(
-            "{phase}  |  {} MiB max  |  {:?}  |  {} px max",
-            job.settings.limit_mib(),
-            job.settings.codec(),
-            job.settings.max_long_edge()
-        );
+        let phase = if let Some(reason) = job.failure.as_deref().or(job.skip_reason) {
+            format!("{phase}: {reason}")
+        } else { phase.to_owned() };
+        let mut status = format!("{phase}  |  Source {}", source_size(job));
+        if let Some(settings) = job.settings {
+            let target = match settings.target() {
+                Target::Bytes(bytes) => format!("{} MiB", bytes / 1_048_576),
+                Target::Percent(percent) => {
+                    let bytes = job.target_bytes.or_else(|| job.source_bytes.map(|n| settings.limit_bytes(n)));
+                    match bytes {
+                        Some(n) => format!("{percent}% ({})", readable_size(n)),
+                        None => format!("{percent}% (size unknown)"),
+                    }
+                }
+            };
+            status.push_str(&format!("  |  Target ≤ {target}"));
+            if job.phase != Phase::Skipped {
+                status.push_str(&format!("  |  {:?}  |  {} px max", settings.codec(), settings.max_long_edge()));
+            } else {
+                status.push_str("  |  Original retained");
+            }
+        } else if job.phase == Phase::Waiting {
+            status.push_str("  |  Settings applied on Start");
+        }
+        if job.retries > 0 {
+            status.push_str(&format!("  |  Retries {}", job.retries));
+        }
         if let Some(encoder) = job.encoder {
             status.push_str(&format!("  |  {encoder}"));
         }
         if let (Some(bytes), Some(elapsed)) = (job.bytes, job.elapsed) {
             status.push_str(&format!(
-                "  |  {bytes} bytes in {:.1} s",
+                "  |  Output {} in {:.1} s",
+                readable_size(bytes),
                 elapsed.as_secs_f64()
             ));
         } else if !job.phase.finished() {
@@ -252,9 +336,24 @@ pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usi
         let Some(job) = app.snapshot.get(index as usize) else {
             return 0;
         };
-        let mut text = format!("Source: {}", job.source.display());
+        let mut text = String::new();
+        if let Some(error) = &job.encoder_error {
+            text.push_str("FFmpeg/process diagnostic:\n");
+            text.push_str(&diagnostic_preview(error));
+            text.push_str("\n\n");
+        }
+        if let Some(reason) = &job.failure { text.push_str(&format!("Failure: {reason}\n\n")); }
+        if let Some(reason) = job.skip_reason { text.push_str(&format!("Skipped: {reason}\n\n")); }
+        text.push_str(&format!("Source size: {}\nSource: {}", source_size(job), job.source.display()));
+        if let Some(info) = &job.source_info {
+            text.push_str(&format!("\n{info}"));
+        } else { text.push_str("\nSource media metadata not available."); }
+        if let Some(info) = &job.target_info { text.push_str(&format!("\n\nPlanned output: {info}")); }
+        if let Some(path) = &job.destination { text.push_str(&format!("\nDestination: {}", path.display())); }
         if let Some(output) = &job.output {
-            text.push_str(&format!("\nOutput: {}", output.display()));
+            text.push_str(&format!("\n\nSaved output: {}", output.display()));
+            if let Some(info) = &job.output_info { text.push_str(&format!("\n{info}")); }
+            else { text.push_str("\nActual output metadata unavailable."); }
         }
         for line in &job.detail {
             text.push('\n');
@@ -269,6 +368,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn human_size_and_diagnostic_preserve_units_and_error_tail() {
+        assert_eq!(readable_size(0), "0 B");
+        assert_eq!(readable_size(1024), "1.00 KiB");
+        assert_eq!(readable_size(1048576), "1.00 MiB");
+        assert_eq!(readable_size(1 << 40), "1.00 TiB");
+        let long = format!("start {}\nencoder failed", "中文🎬".repeat(4000));
+        let preview = diagnostic_preview(&long);
+        assert!(preview.starts_with("start"));
+        assert!(preview.ends_with("encoder failed"));
+        assert!(preview.len() < 17000);
+    }
+
+    #[test]
     fn boundary_copies_paths_validates_sizes_and_keeps_frame_consistent() {
         let base = std::env::temp_dir();
         let name = "小K 的鹅腿坟场 & (黑洞) ^ % ! 🎬.avi";
@@ -279,33 +391,20 @@ mod tests {
         let mut message = [0; 512];
         unsafe {
             assert_eq!(
-                orca_add_path(
-                    input.as_ptr().cast(),
-                    input.len(),
-                    size.as_ptr().cast(),
-                    2,
-                    1,
-                    1920
-                ),
+                orca_add_path(input.as_ptr().cast(), input.len()),
                 1
             );
             input.fill(0);
             assert_eq!(
-                orca_add_path(
-                    input.as_ptr().cast(),
-                    input.len(),
-                    size.as_ptr().cast(),
-                    2,
-                    1,
-                    1920
-                ),
+                orca_add_path(input.as_ptr().cast(), input.len()),
                 0
             );
-            assert_eq!(
-                orca_frame(message.as_mut_ptr(), message.len(), &mut count),
-                0
-            );
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 1);
+            assert_eq!(orca_start(size.as_ptr().cast(), 0, 0, 1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), 0, -1, 1920), 0);
+            assert_eq!(orca_start(b"101".as_ptr().cast(), 3, 1, 1, 1920), 0);
+            assert_eq!(orca_start(size.as_ptr().cast(), size.len(), 2, 1, 1920), 0);
             let mut row = std::mem::MaybeUninit::<Row>::uninit();
             assert_eq!(orca_row(0, row.as_mut_ptr(), 1), -1);
             assert_eq!(orca_row(0, row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
@@ -316,21 +415,36 @@ mod tests {
                     .unwrap(),
                 name
             );
+            assert!(std::ffi::CStr::from_ptr(row.status.as_ptr()).to_str().unwrap()
+                .contains("Settings applied on Start"));
             assert_eq!(orca_action(1, row.id), 1);
             assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
             assert!(!std::ffi::CStr::from_ptr(message.as_ptr())
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
-            assert_eq!(
-                orca_frame(message.as_mut_ptr(), message.len(), &mut count),
-                0
-            );
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(orca_detail(0, message.as_mut_ptr(), message.len()), 1);
             assert!(std::ffi::CStr::from_ptr(message.as_ptr())
                 .to_str()
                 .unwrap()
                 .contains("Cancelled"));
+            let mut reset_row = std::mem::MaybeUninit::<Row>::uninit();
+            assert_eq!(orca_row(0, reset_row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
+            let reset_row = reset_row.assume_init();
+            assert_eq!(reset_row.flags, 2);
+            assert_eq!(orca_action(4, reset_row.id), 1);
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
+            assert_eq!(count, 1);
+            let mut fresh_row = std::mem::MaybeUninit::<Row>::uninit();
+            assert_eq!(orca_row(0, fresh_row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
+            let fresh_row = fresh_row.assume_init();
+            assert_eq!(fresh_row.flags, 1);
+            assert_ne!(fresh_row.id, reset_row.id);
+            assert_eq!(orca_action(4, fresh_row.id), 0);
+            assert_eq!(orca_action(3, 0), 1);
+            assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
+            assert_eq!(count, 0);
             let mut small = [123; 3];
             assert!(write_text(small.as_mut_ptr(), small.len(), "🎬"));
             assert_eq!(small, [0, 123, 123]);

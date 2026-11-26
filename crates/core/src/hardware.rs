@@ -15,8 +15,49 @@ pub fn inventory()->Inventory {
     #[cfg(not(windows))] let cpu=std::env::var("PROCESSOR_IDENTIFIER").ok();
     Inventory{cpu,logical_cpus:std::thread::available_parallelism().ok().map(|n|n.get()),adapters,adapter_scan_complete,adapter_scan_error}
 }
+/// Conservative job slots from the detected adapter model and NVIDIA's
+/// physical NVENC count, not the driver session limit. Unknown models and
+/// ambiguous multiple NVIDIA adapters stay serial.
+/// https://developer.nvidia.com/video-encode-decode-support-matrix
+pub fn queue_parallelism(inv: &Inventory) -> usize {
+    if !inv.adapter_scan_complete { return 1; }
+    let mut nvidia = inv.adapters.iter().filter(|a| a.instance_id.as_deref()
+        .is_some_and(|id| id.to_ascii_uppercase().starts_with("PCI\\VEN_10DE")));
+    let Some(adapter) = nvidia.next() else { return 1; };
+    if nvidia.next().is_some() { return 1; }
+    let Some(name) = adapter.name.as_deref() else { return 1; };
+    let name = name.trim().to_ascii_lowercase();
+    let name = name.strip_prefix("nvidia ").unwrap_or(&name);
+    let name = name.strip_suffix(" laptop gpu").map(|s| format!("{s} laptop"))
+        .unwrap_or_else(|| name.to_owned());
+    if matches!(name.as_str(),
+        "geforce rtx 4070 ti" | "geforce rtx 4070 ti super" |
+        "geforce rtx 4080" | "geforce rtx 4080 16gb" | "geforce rtx 4080 super" |
+        "geforce rtx 4080 laptop" | "geforce rtx 4090" | "geforce rtx 4090 laptop" |
+        "geforce rtx 5070 ti" | "geforce rtx 5080" | "geforce rtx 5080 laptop" |
+        "geforce rtx 5090" | "geforce rtx 5090 laptop" |
+        "rtx 6000 ada generation" | "l40") { 2 } else { 1 }
+}
+
+#[cfg(test)]
+#[test]
+fn queue_parallelism_requires_known_physical_engines() {
+    let mut inv = Inventory { cpu: None, logical_cpus: None, adapters: vec![
+        Adapter { name: Some("NVIDIA GeForce RTX 4080".into()), instance_id: Some("PCI\\VEN_10DE&DEV_2704".into()), driver_version: None }
+    ], adapter_scan_complete: true, adapter_scan_error: None };
+    assert_eq!(queue_parallelism(&inv), 2);
+    inv.adapters[0].name = Some("NVIDIA T600".into());
+    assert_eq!(queue_parallelism(&inv), 1);
+    inv.adapters[0].name = Some("NVIDIA GeForce RTX 5070 Ti Laptop GPU".into());
+    assert_eq!(queue_parallelism(&inv), 1);
+    inv.adapters[0].name = Some("NVIDIA GeForce RTX 4080 Laptop GPU".into());
+    assert_eq!(queue_parallelism(&inv), 2);
+    inv.adapters.push(inv.adapters[0].clone());
+    assert_eq!(queue_parallelism(&inv), 1);
+}
+
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub enum Evidence { NotListed, Verified, Failed, TimedOut }
+pub enum Evidence { NotListed, AdapterAbsent, Verified, Failed, TimedOut }
 #[derive(Debug,Clone)]
 pub struct Capability {pub encoder:String,pub bit_depth:u8,pub evidence:Evidence,pub diagnostic:String}
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -68,6 +109,42 @@ fn try_encoder(exe:&Path,name:&str,bits:u8,cancel:&AtomicBool)->io::Result<Capab
     Ok(Capability{encoder:name.into(),bit_depth:bits,evidence,diagnostic})
 }
 impl Detector{
+    /// Discover compiled hardware encoders and present adapters without encoding.
+    pub(crate) fn list_for_transcode(&mut self, exe: &Path, cancel: &AtomicBool) -> io::Result<Report> {
+        let exe = std::fs::canonicalize(exe)?;
+        let meta = std::fs::metadata(&exe)?;
+        let inv = inventory();
+        let tool = ToolFingerprint {
+            executable: exe.clone(),
+            size_bytes: meta.len(),
+            modified: meta.modified().ok(),
+        };
+        let listed_encoders = checked_text(&exe, &["-hide_banner", "-encoders"], cancel)?;
+        let version = checked_text(&exe, &["-version"], cancel)?;
+        let complete_pci_inventory = inv.adapter_scan_complete && inv.adapters.iter().all(|adapter| {
+            adapter.instance_id.as_deref().is_some_and(|id| id.starts_with("PCI\\VEN_"))
+        });
+        let capabilities = ENCODERS.iter().filter_map(|&(encoder, bit_depth)| {
+            let vendor = if encoder.ends_with("_nvenc") { "10DE" }
+                else if encoder.ends_with("_qsv") { "8086" }
+                else { "1002" };
+            let present = inv.adapters.iter().any(|adapter| {
+                adapter.instance_id.as_deref().and_then(|id| id.strip_prefix("PCI\\VEN_")).and_then(|id| id.get(..4))
+                    .is_some_and(|id| id.eq_ignore_ascii_case(vendor))
+            });
+            let compiled = listed(&listed_encoders, encoder);
+            let (evidence, diagnostic) = if !compiled {
+                (Evidence::NotListed, "encoder not compiled into this ffmpeg")
+            } else if complete_pci_inventory && !present {
+                (Evidence::AdapterAbsent, "matching PCI display adapter not present")
+            } else {
+                return None;
+            };
+            Some(Capability { encoder: encoder.into(), bit_depth, evidence, diagnostic: diagnostic.into() })
+        }).collect();
+        Ok(Report { inventory: inv, tool_version: version, tool, capabilities, cache_hit: false })
+    }
+
     /// Memory cache only, keyed by present adapters/driver, tool identity and CPU.
     /// Failed/timed-out probes are evidence of this attempt, not permanent unsupported claims.
     pub fn detect(&mut self,exe:&Path,cancel:&AtomicBool)->io::Result<Report>{

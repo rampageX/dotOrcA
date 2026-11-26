@@ -15,6 +15,10 @@ fn main() {
     for lib in ["user32", "gdi32", "opengl32", "shell32", "imm32", "dwmapi", "comdlg32", "ole32", "advapi32"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
+    let icon = dir.join("dotorca.res");
+    assert!(icon.is_file(), "missing {}", icon.display());
+    println!("cargo:rerun-if-changed={}", icon.display());
+    println!("cargo:rustc-link-arg-bin=dotorca={}", icon.display());
     println!("cargo:rustc-link-arg=/OPT:REF");
     println!("cargo:rustc-link-arg=/OPT:ICF");
 }
