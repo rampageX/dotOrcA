@@ -39,6 +39,7 @@ typedef struct {
     int font_ok;
     int callback_error;
     int icon_tried;
+    bool confirm_clear_all;
 } window_state;
 
 /* No font bundled: read a local Windows font by a wide filesystem path.
@@ -130,13 +131,13 @@ static int apply_window_icon(HWND hwnd) {
     HINSTANCE module = GetModuleHandleW(NULL);
     HICON big = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
-    HICON small = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+    HICON small_icon = (HICON)LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
-    if (!big || !small) return 0;
+    if (!big || !small_icon) return 0;
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
-    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);
     return SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0) == (LRESULT)big &&
-           SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0) == (LRESULT)small;
+           SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0) == (LRESULT)small_icon;
 }
 
 static void frame(cui_ctx *ui, void *user) {
@@ -155,7 +156,7 @@ static void frame(cui_ctx *ui, void *user) {
         cui_request_wakeup(ui, 0.05f);
     }
 
-    collect_drop(ui, window);
+    if (!window->confirm_clear_all) collect_drop(ui, window);
     uint32_t count = 0;
     char status[768] = {0};
     int busy = orca_frame(status, sizeof(status), &count);
@@ -193,9 +194,22 @@ static void frame(cui_ctx *ui, void *user) {
                 action(ui, window, CLEAR_FINISHED, 0);
             }
             if (cui_button(ui, "Clear All", .disabled = !count)) {
-                if (MessageBoxW(GetActiveWindow(),
-                    L"Stop all active tasks and clear the entire queue?\nSource files and saved outputs will not be deleted.",
-                    L"dotOrcA - Clear All", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                window->confirm_clear_all = true;
+                cui_request_redraw(ui);
+            }
+        }
+    }
+    if (window->confirm_clear_all) {
+        cui_dialog(ui, "Clear All", &window->confirm_clear_all,
+                   .width = 440, .description = "Stop active tasks and clear the entire queue?") {
+            cui_text(ui, "Source files and saved outputs will not be deleted.", .width = CUI_FILL);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "Keep tasks")) {
+                    window->confirm_clear_all = false;
+                    cui_request_redraw(ui);
+                }
+                if (cui_button(ui, "Clear All", .variant = CUI_BUTTON_PRIMARY)) {
+                    window->confirm_clear_all = false;
                     window->expanded = 0;
                     action(ui, window, CLEAR_ALL, 0);
                 }
@@ -272,6 +286,17 @@ int orca_cui_self_test(void) {
         !strstr(status, "1 cancelled")) goto done;
     if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 1) goto done;
+    result = 16;
+    /* Render the modal in the normal frame path; opening/dismissing it
+       must not clear the queue. The positive action is covered below. */
+    window.confirm_clear_all = true;
+    if (!cui_app_frame(app)) goto done;
+    frame(ui, &window);
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 1) goto done;
+    window.confirm_clear_all = false;
+    if (!cui_app_frame(app)) goto done;
+    frame(ui, &window);
+    if (orca_frame(status, sizeof(status), &count) < 0 || count != 1) goto done;
     result = 14;
     if (orca_action(CLEAR_ALL, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 0) goto done;
