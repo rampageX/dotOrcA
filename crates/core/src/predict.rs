@@ -10,7 +10,7 @@ pub const MODEL_VERSION:&str="reference-pipeline-v1";
 /// Same SHA256 route used by S02, not just the displayed FFmpeg version.
 pub fn tool_sha256(ffmpeg:&Path,tool:&Path,cancel:&std::sync::atomic::AtomicBool)->io::Result<String>{crate::benchmark::file_hash(ffmpeg,tool,cancel)}
 const OFFICIAL:&str=include_str!("../../../data/official/s02-physical-v1.json");
-const MAP:&str=include_str!("../../../data/official/hardware-map-v1.json");
+const MAP:&str=include_str!("../../../data/official/hardware-map-v2.json");
 const MAX_BYTES:u64=16*1024*1024;
 fn bad(s:&str)->io::Error{io::Error::new(io::ErrorKind::InvalidData,s)}
 fn arr<'a>(v:&'a Value,k:&str)->io::Result<&'a Vec<Value>>{v[k].as_array().ok_or_else(||bad(k))}
@@ -111,8 +111,8 @@ impl Database{
     pub fn bundled()->io::Result<Self>{
         let official=parse(OFFICIAL,"official")?;
         let mapping:Value=serde_json::from_str(MAP).map_err(|e|bad(&e.to_string()))?;
-        if mapping["schema_version"]!=1||mapping["version"]!="hardware-map-v1"||official.len()!=2||official.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>()!=264{return Err(bad("bundled database integrity"))}
-        let nvenc:Value=serde_json::from_str(include_str!("../../../data/official/nvenc-sdk13.1-v1.json")).map_err(|e|bad(&e.to_string()))?;
+        if mapping["schema_version"]!=1||mapping["version"]!="hardware-map-v2"||official.len()!=2||official.iter().map(|d|d["records"].as_array().map_or(0,Vec::len)).sum::<usize>()!=264{return Err(bad("bundled database integrity"))}
+        let nvenc:Value=serde_json::from_str(include_str!("../../../data/official/nvenc-sdk13.1-v2.json")).map_err(|e|bad(&e.to_string()))?;
         if nvenc["schema_version"]!=1||nvenc["version"]!=nvenc::VERSION{return Err(bad("vendor reference schema"))}
         Ok(Self{official,local:Vec::new(),mapping,nvenc})
     }
