@@ -269,7 +269,7 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             Phase::Failed => "Failed",
             Phase::Cancelled => "Cancelled",
         };
-        let phase = if let Some(reason) = &job.failure {
+        let phase = if let Some(reason) = job.failure.as_deref().or(job.skip_reason) {
             format!("{phase}: {reason}")
         } else { phase.to_owned() };
         let mut status = format!("{phase}  |  Source {}", source_size(job));
@@ -343,6 +343,7 @@ pub unsafe extern "C" fn orca_detail(index: u32, out: *mut c_char, capacity: usi
             text.push_str("\n\n");
         }
         if let Some(reason) = &job.failure { text.push_str(&format!("Failure: {reason}\n\n")); }
+        if let Some(reason) = job.skip_reason { text.push_str(&format!("Skipped: {reason}\n\n")); }
         text.push_str(&format!("Source size: {}\nSource: {}", source_size(job), job.source.display()));
         if let Some(info) = &job.source_info {
             text.push_str(&format!("\n{info}"));

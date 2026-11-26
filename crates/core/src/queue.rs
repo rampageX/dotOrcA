@@ -123,11 +123,11 @@ pub struct Job {
     pub output_info: Option<String>,
     pub failure: Option<String>,
     pub destination: Option<PathBuf>,
-    pub reset_attempt: bool,
+    pub skip_reason: Option<&'static str>,
 }
 
 impl Job {
-    fn waiting(id: u32, source: &Path, reset_attempt: bool) -> Self {
+    fn waiting(id: u32, source: &Path) -> Self {
         Self {
             id,
             source: source.into(),
@@ -152,7 +152,7 @@ impl Job {
             output_info: None,
             failure: None,
             destination: None,
-            reset_attempt,
+            skip_reason: None,
         }
     }
 }
@@ -264,7 +264,7 @@ impl Queue {
             .ok_or("Queue ID range exhausted.")?;
         let id = state.next;
         state.entries.push(Entry {
-            view: Arc::new(Job::waiting(id, source, false)),
+            view: Arc::new(Job::waiting(id, source)),
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.shared.size_ready.notify_one();
@@ -327,7 +327,7 @@ impl Queue {
         let source = state.entries[index].view.source.clone();
         state.next = next;
         state.entries[index] = Entry {
-            view: Arc::new(Job::waiting(next, &source, true)),
+            view: Arc::new(Job::waiting(next, &source)),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         self.shared.size_ready.notify_one();
@@ -622,28 +622,20 @@ fn media_summary(info: &crate::media::MediaInfo) -> String {
     lines.join("\n")
 }
 
-// A reset is an explicit request for another attempt. Preserve every old
-// output; only reset attempts may select a new suffix on a name conflict.
-// Publication itself still checks atomically that the destination is absent.
-fn output_path(dir: &Path, source: &Path, reset_attempt: bool) -> io::Result<PathBuf> {
-    let stem = source.file_stem().expect("checked on admission");
-    let mut name = stem.to_os_string();
-    name.push(".mp4");
-    let base = dir.join(name);
-    if !reset_attempt { return Ok(base); }
-    for number in 1..=10_000 {
-        let candidate = if number == 1 { base.clone() } else {
-            let mut name = stem.to_os_string();
-            name.push(format!(" ({number}).mp4"));
-            dir.join(name)
-        };
-        match fs::symlink_metadata(&candidate) {
-            Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(candidate),
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, "No free numbered output filename."))
+// Naming uses the settings frozen at Start, not the actual encoded size.
+fn output_path(dir: &Path, source: &Path, settings: Settings) -> PathBuf {
+    let mut name = source.file_stem().expect("checked on admission").to_os_string();
+    let target = match settings.target() {
+        Target::Bytes(bytes) => format!("{}M", bytes / 1_048_576),
+        Target::Percent(percent) => format!("{percent}%"),
+    };
+    let codec = match settings.codec() {
+        Codec::H264 => "H264",
+        Codec::Hevc => "HEVC",
+        Codec::Av1 => "AV1",
+    };
+    name.push(format!("_{target}_{codec}_{}.MP4", settings.max_long_edge()));
+    dir.join(name)
 }
 
 fn encode(
@@ -692,10 +684,15 @@ fn encode(
                 ),
             ))
         })?;
-        let destination = output_path(&dir, &job.source, job.reset_attempt).map_err(pipeline::Error::Io)?;
+        let destination = output_path(&dir, &job.source, settings);
         update.modify(|job| job.destination = Some(destination.clone()));
-        // The pipeline's existing no-overwrite checks remain authoritative.
-        // Let the source/plan metadata reach Details before a name conflict.
+        // Skip existing targets before launching any media or encoder process.
+        // The pipeline also protects against a destination created concurrently.
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => return Err(pipeline::Error::DestinationExists),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(pipeline::Error::Io(e)),
+        }
         let tool = |name: &str| {
             root.join("tools")
                 .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
@@ -750,6 +747,7 @@ fn encode(
                     note(job, "Cancelled during processing.".into());
                 } else {
                     job.phase = Phase::Skipped;
+                    job.skip_reason = Some("Source already within target capacity");
                     note(job, "Source already within target capacity. Original retained; no output created.".into());
                 }
             }
@@ -769,6 +767,16 @@ fn encode(
                     );
                 }
             }
+            Err(pipeline::Error::DestinationExists) => {
+                if cancel.load(Ordering::Acquire) {
+                    job.phase = Phase::Cancelled;
+                    note(job, "Cancelled during processing.".into());
+                } else {
+                    job.phase = Phase::Skipped;
+                    job.skip_reason = Some("Target file already exists");
+                    note(job, "Target file already exists. Existing output retained; no overwrite.".into());
+                }
+            }
             Err(pipeline::Error::Cancelled) => {
                 job.phase = Phase::Cancelled;
                 note(job, "Cancelled during processing.".into());
@@ -781,9 +789,6 @@ fn encode(
                         "FFmpeg/process failed".into()
                     }
                     pipeline::Error::HardwareRouteUnavailable => "No compatible hardware route. See the preflight or encoding failure details.".into(),
-                    pipeline::Error::DestinationExists => {
-                        "Output conflict: destination already exists (not overwritten).".into()
-                    }
                     pipeline::Error::Io(error)
                         if error.kind() == io::ErrorKind::PermissionDenied =>
                     {
@@ -912,6 +917,7 @@ mod tests {
                 job.bytes = Some(50);
                 job.retries = 2;
                 job.failure = Some("old failure".into());
+                job.skip_reason = Some("old skip");
                 job.encoder_error = Some("old stderr".into());
                 job.detail.push("old detail".into());
             });
@@ -921,7 +927,7 @@ mod tests {
             assert_ne!(job.id,id);
             assert_eq!(job.source,source);
             assert_eq!(job.phase,Phase::Waiting);
-            assert!(job.reset_attempt && job.settings.is_none() && job.target_bytes.is_none());
+            assert!(job.skip_reason.is_none() && job.settings.is_none() && job.target_bytes.is_none());
             assert!(job.progress_percent.is_none() && job.output.is_none() && job.bytes.is_none());
             assert!(job.failure.is_none() && job.encoder_error.is_none() && job.detail.is_empty());
             assert_eq!(job.retries,0);
@@ -933,19 +939,33 @@ mod tests {
     }
 
     #[test]
-    fn reset_output_naming_preserves_existing_files() {
-        let root = std::env::temp_dir().join(format!("dotorca-reset-{}", std::process::id()));
+    fn parameter_output_names_and_duplicate_skip_without_tools() {
+        let root = std::env::temp_dir().join(format!("dotorca-names-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         let source = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
-        let base = source.with_extension("mp4");
-        fs::write(&base, b"previous output").unwrap();
-        assert_eq!(output_path(&root,&source,false).unwrap(),base);
-        let second = output_path(&root,&source,true).unwrap();
-        assert!(second.file_name().unwrap().to_string_lossy().ends_with(" (2).mp4"));
-        fs::write(&second,b"second output").unwrap();
-        let third = output_path(&root,&source,true).unwrap();
-        assert!(third.file_name().unwrap().to_string_lossy().ends_with(" (3).mp4"));
-        assert_eq!(fs::read(&base).unwrap(),b"previous output");
+        fs::File::create(&source).unwrap().set_len(2_000_000).unwrap();
+        let pct = Settings::percentage(50, Codec::Hevc, 1920).unwrap();
+        let fixed = Settings::new(100, Codec::Av1, 3840).unwrap();
+        let dir = root.join("output");
+        fs::create_dir(&dir).unwrap();
+        let target = output_path(&dir,&source,pct);
+        assert_eq!(target.file_name().unwrap().to_str().unwrap(),"小K 的鹅腿坟场 & (黑洞) ^ % !_50%_HEVC_1920.MP4");
+        assert!(output_path(&dir,&source,fixed).ends_with("小K 的鹅腿坟场 & (黑洞) ^ % !_100M_AV1_3840.MP4"));
+        fs::write(&target,b"previous output").unwrap();
+        let queue = Queue::portable(root.clone()).unwrap();
+        queue.add(&source).unwrap();
+        queue.start(pct).unwrap();
+        let jobs = await_finished(&queue);
+        assert_eq!(jobs[0].phase,Phase::Skipped);
+        assert_eq!(jobs[0].skip_reason,Some("Target file already exists"));
+        assert_eq!(jobs[0].destination.as_ref(),Some(&target));
+        assert!(jobs[0].encoder.is_none() && jobs[0].output.is_none());
+        queue.reset(jobs[0].id).unwrap();
+        queue.start(pct).unwrap();
+        assert_eq!(await_finished(&queue)[0].skip_reason,Some("Target file already exists"));
+        assert_eq!(fs::read(&target).unwrap(),b"previous output");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(),1);
+        queue.shutdown();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1149,11 +1169,15 @@ mod tests {
             ("DOTORCA_TEST_FFMPEG", "ffmpeg"),
             ("DOTORCA_TEST_FFPROBE", "ffprobe"),
         ] {
-            fs::copy(
-                std::env::var_os(key).unwrap(),
-                tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
-            )
-            .unwrap();
+            let original = fs::canonicalize(std::env::var_os(key).unwrap()).unwrap();
+            let local = tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            // Linux can return ETXTBSY when a freshly copied executable is
+            // still held open by a transient reader. Link the CI fixture
+            // instead; Windows still tests the actual portable copied tools.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(original, local).unwrap();
+            #[cfg(not(unix))]
+            fs::copy(original, local).unwrap();
         }
         let source = root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
         let output = crate::process::run(
@@ -1207,8 +1231,8 @@ mod tests {
             bytes
         );
         assert!(jobs[0].eta.is_none());
-        assert_eq!(jobs[1].phase, Phase::Failed);
-        assert!(jobs[1].failure.as_deref().unwrap().contains("Output conflict"));
+        assert_eq!(jobs[1].phase, Phase::Skipped);
+        assert_eq!(jobs[1].skip_reason, Some("Target file already exists"));
         assert!(jobs[1].destination.is_some());
         assert!(jobs[0].source_info.as_deref().unwrap().contains("320 × 180"));
         assert!(jobs[0].target_info.as_deref().unwrap().contains("256 × 144"));
@@ -1225,17 +1249,17 @@ mod tests {
         assert!(queue.snapshot().is_empty());
         assert!(source.exists());
         assert!(jobs[0].output.as_ref().unwrap().is_file());
-        // Re-add the same source, first demonstrate a normal conflict, then
-        // reset it and successfully produce a separate file using new settings.
+        // Same settings skip; reset and change settings to encode separately.
         let repeat_id = queue.add(&source).unwrap();
         queue.start(settings()).unwrap();
-        assert_eq!(await_finished(&queue)[0].phase, Phase::Failed);
+        assert_eq!(await_finished(&queue)[0].phase, Phase::Skipped);
         queue.reset(repeat_id).unwrap();
         let changed = Settings::new(1, Codec::H264, 192).unwrap();
         queue.start(changed).unwrap();
         let repeat = await_finished(&queue);
         assert_eq!(repeat[0].phase, Phase::Published, "{:?}",repeat[0]);
         assert_ne!(repeat[0].output,jobs[0].output);
+        assert!(repeat[0].output.as_ref().unwrap().ends_with("小K 的鹅腿坟场 & (黑洞) ^ % !_1M_H264_192.MP4"));
         assert!(repeat[0].target_info.as_deref().unwrap().contains("192 × 108"));
         assert!(jobs[0].output.as_ref().unwrap().is_file());
         queue.clear_finished();
