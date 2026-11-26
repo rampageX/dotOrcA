@@ -12,3 +12,6 @@ Same Windows machine, drive, power plan, display and Defender policy. Run each c
 - Test resizing/minimize/restore, 100–200% and mixed DPI, normal user.
 - Compare overall appearance with dark-theme coverage. Startup is primary; size and memory secondary. No fabricated benchmarks.
 S00 remains open; no production engine migration yet.
+
+## First CI run (2026-11-26)
+- Baseline a5f9a94656dcbdf82ab9820c0f6d0e9d9e79cb7f, PR run 45767407624: GPUI succeeded; NWG E0446 (private Probe in NwgUi public interface); WinSafe E0560 (ButtonOpts uses width/height rather than size). Corrected both source errors, GPUI unchanged. Node.js 20 action deprecation warning is unrelated to the compilation failures. Rebuild pending.

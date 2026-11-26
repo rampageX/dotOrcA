@@ -20,11 +20,11 @@ fn main() -> w::AnyResult<()> {
         resize_behavior: (gui::Horz::Resize, gui::Vert::Resize), ..Default::default()
     });
     let run = gui::Button::new(&wnd, gui::ButtonOpts {
-        text: START, position: gui::dpi(12, 350), size: gui::dpi(220, 30),
+        text: START, position: gui::dpi(12, 350), width: gui::dpi_x(220), height: gui::dpi_y(30),
         resize_behavior: (gui::Horz::None, gui::Vert::Repos), ..Default::default()
     });
     let clear = gui::Button::new(&wnd, gui::ButtonOpts {
-        text: CLEAR, position: gui::dpi(250, 350), size: gui::dpi(120, 30),
+        text: CLEAR, position: gui::dpi(250, 350), width: gui::dpi_x(120), height: gui::dpi_y(30),
         resize_behavior: (gui::Horz::None, gui::Vert::Repos), ..Default::default()
     });
     let (w2, s2, work2) = (wnd.clone(), status.clone(), worker.clone());

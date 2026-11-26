@@ -6,7 +6,7 @@ use nwg::NativeUi;
 use std::time::Duration;
 
 #[derive(Default, NwgUi)]
-struct Probe {
+pub struct Probe {
     #[nwg_control(size: (720, 400), title: "dotOrcA S00 | NWG", accept_files: true)]
     #[nwg_events(OnWindowClose: [nwg::stop_thread_dispatch()], OnFileDrop: [Probe::drop_files(SELF, EVT_DATA)])]
     window: nwg::Window,
