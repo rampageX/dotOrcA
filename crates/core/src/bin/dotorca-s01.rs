@@ -120,13 +120,18 @@ fn media_fixtures(ffmpeg:&Path,ffprobe:&Path)->io::Result<()>{
     let m2=media::probe(ffprobe,&copy,&cancel)?;
     if m2.size_bytes!=m.size_bytes||m2.duration_us!=m.duration_us{return Err(io::Error::other("long path fixture mismatch"));}
     println!("PASS real long Unicode path");
-    for (transfer,expected) in [("smpte2084",media::Hdr::Pq),("arib-std-b67",media::Hdr::Hlg),("bt709",media::Hdr::Sdr)]{
-        let path=root.join(format!("{transfer}.mkv"));
-        let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i","testsrc2=s=128x96:r=25,format=yuv420p10le","-frames:v","3","-c:v","libx265","-preset","ultrafast","-x265-params","log-level=error:pools=1:frame-threads=1","-pix_fmt","yuv420p10le","-color_trc",transfer,"-color_primaries","bt2020","-colorspace","bt2020nc","-color_range","tv","-y"].into_iter().map(Into::into).collect();
+    for (transfer,trc,expected) in [("smpte2084",16,media::Hdr::Pq),("arib-std-b67",18,media::Hdr::Hlg),("bt709",1,media::Hdr::Sdr)]{
+        let path=root.join(format!("{transfer}.mp4"));
+        // Mark actual input frames, codec VUI and MP4 colr. Do not assume
+        // output AVCodecContext options alone survive filter/encoder negotiation.
+        let source=format!("testsrc2=s=128x96:r=25,format=yuv420p10le,setparams=range=limited:color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc");
+        let params=format!("log-level=error:pools=1:frame-threads=1:colorprim=9:transfer={trc}:colormatrix=9:range=limited");
+        let bsf=format!("hevc_metadata=colour_primaries=9:transfer_characteristics={trc}:matrix_coefficients=9:video_full_range_flag=0");
+        let mut args:Vec<OsString>=["-hide_banner","-loglevel","error","-nostdin","-f","lavfi","-i",&source,"-frames:v","8","-c:v","libx265","-preset","ultrafast","-x265-params",&params,"-pix_fmt","yuv420p10le","-color_trc",transfer,"-color_primaries","bt2020","-colorspace","bt2020nc","-color_range","tv","-bsf:v",&bsf,"-tag:v","hvc1","-movflags","+write_colr","-y"].into_iter().map(Into::into).collect();
         args.push(path.as_os_str().into());run_ffmpeg(args)?;
         let m=media::probe(ffprobe,&path,&cancel)?;
         let v=&m.streams[0];
-        if v.hdr!=expected||v.bit_depth!=Some(10)||v.color_transfer.as_deref()!=Some(transfer)||v.color_range.as_deref()!=Some("tv"){return Err(io::Error::other(format!("color fixture mismatch: {:?}",v)));}
+        if v.hdr!=expected||v.bit_depth!=Some(10)||v.color_transfer.as_deref()!=Some(transfer)||v.color_primaries.as_deref()!=Some("bt2020")||v.color_range.as_deref()!=Some("tv"){return Err(io::Error::other(format!("color fixture mismatch: {:?}",v)));}
         println!("PASS real {transfer} 10-bit color tags");
     }
     let invalid=root.join("invalid.avi");std::fs::write(&invalid,b"not a media file")?;

@@ -40,9 +40,10 @@ jobs:
           & ./target/release/dotorca-s01.exe --ffmpeg $ffmpeg --ffprobe $ffprobe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Windows artifact
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (success() || failure())
         shell: pwsh
         run: |
+          if (-not (Test-Path target/release/dotorca-s01.exe)) { throw 'No compiled EXE' }
           New-Item -ItemType Directory -Force dist-s01 | Out-Null
           Copy-Item target/release/dotorca-s01.exe dist-s01/
           Copy-Item Cargo.lock dist-s01/
@@ -56,7 +57,7 @@ jobs:
           & $dumpbin.FullName /dependents dist-s01/dotorca-s01.exe | Out-File dist-s01/pe-imports.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (success() || failure())
         with:
           name: dotOrcA-S01
           path: dist-s01/
