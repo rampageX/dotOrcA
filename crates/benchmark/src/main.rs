@@ -6,7 +6,7 @@ fn usage() {
     println!("dotOrcA Benchmark S02\n\
 Usage: orca-benchmark [--ffmpeg PATH] [--ffprobe PATH] [--output DIR] [--smoke] [--repeats 1..5]\n\
 Default: tools/ffmpeg.exe and tools/ffprobe.exe next to EXE; output benchmark-results/ next to EXE.\n\
-Default standard matrix: 720p/1080p/2160p, 8/10-bit, motion/noise, 90 frames at 30 fps.\n\
+Default standard matrix: 720p/1080p/2160p, 8/10-bit, motion/noise, 180 frames at 30 fps.\n\
 --smoke: two 320x180 fixtures, 12 frames; a reduced encoder set. Not training data.\n\
 --repeats: repeat every case (default 1). Runs are serial. No files are uploaded.");
 }
