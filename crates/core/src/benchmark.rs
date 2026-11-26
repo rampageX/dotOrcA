@@ -6,9 +6,15 @@ use std::{fs, io::{self, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicBoo
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
-fn system_snapshot()->Value {
+pub(crate) fn system_snapshot()->Value {
     #[cfg(windows)] { windows::snapshot() }
     #[cfg(not(windows))] { json!({"kernel_release":fs::read_to_string("/proc/sys/kernel/osrelease").ok().map(|s|s.trim().to_owned()),"os_release":fs::read_to_string("/etc/os-release").ok(),"memory":fs::read_to_string("/proc/meminfo").ok().map(|s|s.lines().take(3).collect::<Vec<_>>().join("\n"))}) }
+}
+
+/// System CPU occupancy sampled before encoding, not per-process attribution.
+pub(crate) fn pretest_cpu_busy()->Option<f64>{
+    #[cfg(windows)] {windows::pretest_cpu_busy()}
+    #[cfg(not(windows))] {None}
 }
 
 pub const SCHEMA: u32 = 1;
@@ -69,7 +75,7 @@ fn hash(r: &Request, cancel: &AtomicBool) -> io::Result<String> {
     if h.len()!=64 || !h.bytes().all(|c|c.is_ascii_hexdigit()) {return Err(invalid("invalid SHA256"));}
     Ok(h.to_ascii_lowercase())
 }
-fn file_hash(exe: &Path, p: &Path, cancel: &AtomicBool) -> io::Result<String> {
+pub(crate) fn file_hash(exe: &Path, p: &Path, cancel: &AtomicBool) -> io::Result<String> {
     hash(&ff(exe).args(["-v","error","-f","data","-i"]).args([p.as_os_str()]).args(["-map","0:0","-c","copy","-f","hash","-hash","sha256","-"]),cancel)
 }
 fn decoded_hash(exe: &Path, p: &Path, f: Fixture, cancel: &AtomicBool) -> io::Result<String> {
@@ -139,9 +145,11 @@ fn metric(o: &Options, f: Fixture, source: &Path, encoded: &Path, filter: &str, 
     if x.stderr.discarded!=0 {return Err(invalid("metric log truncated"));}
     metric_value(&String::from_utf8_lossy(&x.stderr.bytes),if filter=="ssim" {"SSIM"} else {"PSNR"},key)
 }
+/// Explicit conversion is required when +pix_fmt disables auto-inserted filters.
+pub(crate) fn explicit_pixel_format(pix:&str)->String{format!("scale=iw:ih,format={pix}")}
 fn encode(o: &Options,f: Fixture,e: Encoder,preset: &str,source: &Path,out: &Path,cancel: &AtomicBool,record: &mut Value) -> io::Result<()> {
     let pix=if e.hardware {if f.bits==10 {"p010le"} else {"nv12"}} else {f.pix()};
-    let r=ff(&o.ffmpeg).args(["-v","info","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-fps_mode","passthrough","-vf",&format!("scale=iw:ih,format={pix}"),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
+    let r=ff(&o.ffmpeg).args(["-v","info","-progress","pipe:1","-i"]).args([source.as_os_str()]).args(["-map","0:v:0","-an","-fps_mode","passthrough","-vf",&explicit_pixel_format(pix),"-c:v",e.name,e.option,preset,"-b:v",&f.bitrate().to_string(),"-pix_fmt",&format!("+{pix}"),"-color_range","tv","-colorspace","bt709","-color_primaries","bt709","-color_trc","bt709"]).args([out.as_os_str()]);
     record["argv"]=json!(r.args.iter().map(|a|a.to_string_lossy()).collect::<Vec<_>>());
     let start=Instant::now();
     let x=process::run(&r,cancel);

@@ -2,7 +2,26 @@ name: S02 benchmark acceptance
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - 'crates/core/Cargo.toml'
+      - 'crates/core/src/lib.rs'
+      - 'crates/benchmark/**'
+      - 'crates/core/src/benchmark.rs'
+      - 'crates/core/src/benchmark/**'
+      - 'crates/core/src/media.rs'
+      - 'crates/core/src/hardware.rs'
+      - 'crates/core/src/hardware/**'
+      - 'crates/core/src/process.rs'
+      - 'crates/core/src/process/**'
+      - '.github/workflows/s02.yml'
   workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
