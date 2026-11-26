@@ -46,12 +46,29 @@ fn measure(ffmpeg:&Path,ffprobe:&Path,input:&Path,index:u64,route:Route,bitrate:
     let bytes=m.size_bytes.filter(|n|*n>0).ok_or_else(||bad("empty output"))?;fs::remove_file(out)?;
     Ok((Sample{source_seconds:sec,wall_seconds:wall},json!({"offset_seconds":offset,"requested_seconds":duration,"encoded_seconds":sec,"encoded_frames":frames,"wall_seconds":wall,"observed_pipeline_fps":frames as f64/wall,"output_bytes":bytes,"pretest_system_cpu_busy_pct":before,"pretest_gpu_busy_pct":null})))
 }
+/// Only the standalone validation command may accept untagged SDR by explicit
+/// user confirmation. Never override known HDR, HDR side data or a known
+/// unsupported transfer function. Keep the original S01 classification.
+fn source_color(v:&media::Stream,assume_sdr:bool)->io::Result<&'static str>{
+    let hdr_side=v.raw["side_data_list"].as_array().is_some_and(|a|a.iter().any(|x|{
+        let t=x["side_data_type"].as_str().unwrap_or("").to_ascii_lowercase();
+        t.contains("mastering display")||t.contains("content light")||t.contains("hdr")||t.contains("dolby vision")||t.contains("dovi")
+    }));
+    if hdr_side||matches!(v.hdr,media::Hdr::Pq|media::Hdr::Hlg|media::Hdr::DolbyVision){return Err(bad("HDR source is outside SDR validation scope"))}
+    if v.bit_depth!=Some(8)||v.pixel_format.as_deref()!=Some("yuv420p"){return Err(bad(format!("requires 8-bit yuv420p; detected depth={:?}, pixel_format={:?}",v.bit_depth,v.pixel_format)))}
+    match v.hdr{
+        media::Hdr::Sdr=>Ok("metadata_sdr"),
+        media::Hdr::Unknown if assume_sdr&&v.color_transfer.is_none()&&v.color_primaries.as_deref()!=Some("bt2020")&&v.color_space.as_deref()!=Some("bt2020nc")&&v.color_space.as_deref()!=Some("bt2020c")=>Ok("user_confirmed_untagged_sdr"),
+        _=>Err(bad(format!("SDR not established: transfer={:?}, primaries={:?}, matrix={:?}; for known SDR with missing transfer only, use --assume-sdr",v.color_transfer,v.color_primaries,v.color_space)))
+    }
+}
 /// Two 4s windows predict a disjoint 12s window. No source or dataset writes.
-pub fn validate(ffmpeg:&Path,ffprobe:&Path,input:&Path,report:&hardware::Report,cancel:&AtomicBool)->io::Result<Value>{
+pub fn validate(ffmpeg:&Path,ffprobe:&Path,input:&Path,report:&hardware::Report,assume_sdr:bool,cancel:&AtomicBool)->io::Result<Value>{
     let m=media::probe(ffprobe,input,cancel)?;
     let mut videos=m.streams.iter().filter(|s|s.kind.as_deref()==Some("video")&&!s.attached_picture);
     let v=videos.next().ok_or_else(||bad("no video"))?;
-    if videos.next().is_some()||v.hdr!=media::Hdr::Sdr||v.bit_depth!=Some(8)||v.pixel_format.as_deref()!=Some("yuv420p"){return Err(bad("requires one explicitly SDR 8-bit yuv420p video"))}
+    if videos.next().is_some(){return Err(bad("requires exactly one non-attached video stream"))}
+    let color_basis=source_color(v,assume_sdr)?;
     let index=v.index.ok_or_else(||bad("missing stream index"))?;
     let length=v.duration_us.or(m.duration_us).ok_or_else(||bad("unknown duration"))?;
     if length<30_000_000{return Err(bad("choose a video at least 30 seconds long"))}
@@ -74,11 +91,24 @@ pub fn validate(ffmpeg:&Path,ffprobe:&Path,input:&Path,report:&hardware::Report,
         let hi=predicted["heuristic_seconds_range"][1].as_f64().unwrap_or(f64::NAN);
         results.push(json!({"encoder":route.encoder,"preset":route.preset,"status":"ok","samples":[ra,rb],"prediction":predicted,"holdout":rv,"absolute_relative_error_pct":(p/actual.wall_seconds-1.0).abs()*100.0,"covered":actual.wall_seconds>=lo&&actual.wall_seconds<=hi}));
     }
-    Ok(json!({"schema_version":1,"model_version":VERSION,"kind":"real_source_disjoint_window_validation","source":{"codec":v.codec,"width":width,"height":h,"bit_depth":v.bit_depth,"duration_us":length},"target_bitrate_bps":bitrate,"scope":"software decode, format, encode and Matroska video mux; no audio; no production ETA or isolated GPU throughput","system_snapshot":crate::benchmark::system_snapshot(),"results":results}))
+    Ok(json!({"schema_version":1,"model_version":VERSION,"kind":"real_source_disjoint_window_validation","source":{"codec":v.codec,"width":width,"height":h,"bit_depth":v.bit_depth,"duration_us":length,"hdr_classification":format!("{:?}",v.hdr),"color_basis":color_basis,"color_transfer":v.color_transfer,"color_primaries":v.color_primaries,"color_space":v.color_space,"pixel_format":v.pixel_format},"target_bitrate_bps":bitrate,"scope":"software decode, format, encode and Matroska video mux; no audio; no production ETA or isolated GPU throughput","system_snapshot":crate::benchmark::system_snapshot(),"results":results}))
 }
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test] fn untagged_sdr_is_explicit_and_test_only(){
+        fn stream(extra:&str)->media::Stream{
+            let raw=format!(r#"{{"format":{{}},"streams":[{{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","color_space":"bt709"{extra}}}]}}"#);
+            media::parse("test.mp4".into(),raw.as_bytes()).unwrap().streams.remove(0)
+        }
+        let v=stream("");assert_eq!(v.hdr,media::Hdr::Unknown);
+        assert!(source_color(&v,false).is_err());assert_eq!(source_color(&v,true).unwrap(),"user_confirmed_untagged_sdr");
+        assert_eq!(source_color(&stream(r#","color_transfer":"bt709""#),false).unwrap(),"metadata_sdr");
+        for extra in [r#","color_transfer":"smpte2084""#,r#","color_transfer":"arib-std-b67""#,r#","color_transfer":"linear""#,r#","color_primaries":"bt2020""#,r#","side_data_list":[{"side_data_type":"Mastering display metadata"}]"#,r#","side_data_list":[{"side_data_type":"DOVI configuration record"}]"#]{
+            assert!(source_color(&stream(extra),true).is_err(),"{extra}");
+        }
+        let mut deep=v.clone();deep.bit_depth=Some(10);assert!(source_color(&deep,true).is_err());
+    }
     #[test] fn projection_and_limits(){
         let a=Sample{source_seconds:4.0,wall_seconds:2.0};let b=Sample{source_seconds:4.0,wall_seconds:4.0};
         let v=estimate(&[a,b],12.0).unwrap();assert_eq!(v["estimated_video_seconds"],9.0);assert_eq!(v["heuristic_seconds_range"],json!([3.0,18.0]));assert!(v["production_seconds"].is_null());
