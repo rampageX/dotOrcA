@@ -7,3 +7,4 @@ pub mod benchmark;
 pub mod predict;
 pub mod budget;
 pub mod decision;
+pub mod pipeline;
