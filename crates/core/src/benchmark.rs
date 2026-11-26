@@ -91,7 +91,7 @@ fn listed(list: &str, name: &str) -> bool {
 fn fixtures(smoke: bool) -> Vec<Fixture> {
     if smoke {return vec![Fixture{width:320,height:180,bits:8,noisy:false,frames:12},Fixture{width:320,height:180,bits:10,noisy:true,frames:12}];}
     let mut v=Vec::new();
-    for (width,height) in [(1280,720),(1920,1080),(3840,2160)] {for bits in [8,10] {for noisy in [false,true] {v.push(Fixture{width,height,bits,noisy,frames:90});}}}
+    for (width,height) in [(1280,720),(1920,1080),(3840,2160)] {for bits in [8,10] {for noisy in [false,true] {v.push(Fixture{width,height,bits,noisy,frames:180});}}}
     v
 }
 fn media_record(m: &media::MediaInfo, f: Fixture, codec: &str) -> io::Result<Value> {
@@ -113,7 +113,14 @@ fn create_fixture(o: &Options, f: Fixture, path: &Path, cancel: &AtomicBool) -> 
     let m=media::probe(&o.ffprobe,path,cancel)?;
     let record=media_record(&m,f,"ffv1")?;
     count_frames(&o.ffprobe,path,f,cancel)?;
-    Ok(json!({"id":f.id(),"generator":f.source(),"frames":f.frames,"fps":{"numerator":30,"denominator":1},"width":f.width,"height":f.height,"bit_depth":f.bits,"target_bitrate_bps":f.bitrate(),"file_sha256":file_hash(&o.ffmpeg,path,cancel)?,"decoded_sha256":decoded_hash(&o.ffmpeg,path,f,cancel)?,"media":record}))
+    // Decode-only baseline is separate evidence; never subtract it from overlapping
+    // encode time or pretend end-to-end measurements are pure encoder throughput.
+    let decode=ff(&o.ffmpeg).args(["-v","error","-progress","pipe:1","-i"]).args([path.as_os_str()]).args(["-map","0:v:0","-an","-f","null","-"]);
+    let start=Instant::now();
+    let decoded=checked(&decode,cancel)?;
+    let decode_wall_seconds=start.elapsed().as_secs_f64();
+    ensure_frames(&decoded,f)?;
+    Ok(json!({"id":f.id(),"generator":f.source(),"frames":f.frames,"fps":{"numerator":30,"denominator":1},"width":f.width,"height":f.height,"bit_depth":f.bits,"target_bitrate_bps":f.bitrate(),"decode_baseline_wall_seconds":decode_wall_seconds,"decode_baseline_fps":f64::from(f.frames)/decode_wall_seconds,"file_sha256":file_hash(&o.ffmpeg,path,cancel)?,"decoded_sha256":decoded_hash(&o.ffmpeg,path,f,cancel)?,"media":record}))
 }
 fn metric_value(stderr: &str, filter: &str, key: &str) -> io::Result<Value> {
     let line=stderr.lines().rev().find(|l|l.contains(filter)&&l.contains(key)).ok_or_else(||invalid(format!("missing {filter} summary")))?;
