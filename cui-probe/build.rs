@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=static=cui_bridge");
     println!("cargo:rustc-link-lib=static=cui");
-    for lib in ["user32", "gdi32", "opengl32", "shell32", "imm32", "dwmapi", "comdlg32", "ole32"] {
+    for lib in ["user32", "gdi32", "opengl32", "shell32", "imm32", "dwmapi", "comdlg32", "ole32", "advapi32"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
     println!("cargo:rustc-link-arg=/OPT:REF");
