@@ -1,0 +1,67 @@
+name: S01 core acceptance
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bootstrap lockfile (temporary)
+        shell: pwsh
+        run: |
+          cargo generate-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Content Cargo.lock
+      - run: cargo test --locked -p orca-core
+      - name: Build and process self-test
+        shell: pwsh
+        run: |
+          if ($IsWindows) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
+          cargo build --locked --release -p orca-core --bin dotorca-s01
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = if ($IsWindows) { './target/release/dotorca-s01.exe' } else { './target/release/dotorca-s01' }
+          & $exe --self-test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Real Windows media fixtures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $env:PATH += ";C:\ProgramData\chocolatey\bin"
+          }
+          $ffmpeg = (Get-Command ffmpeg -CommandType Application).Source
+          $ffprobe = (Get-Command ffprobe -CommandType Application).Source
+          & ./target/release/dotorca-s01.exe --ci-media --ffmpeg $ffmpeg --ffprobe $ffprobe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-s01 | Out-Null
+          Copy-Item target/release/dotorca-s01.exe dist-s01/
+          Copy-Item Cargo.lock dist-s01/
+          git rev-parse HEAD | Out-File dist-s01/source-sha.txt
+          rustc -Vv | Out-File dist-s01/rustc.txt
+          Get-FileHash dist-s01/dotorca-s01.exe -Algorithm SHA256 | Format-List | Out-File dist-s01/sha256.txt
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          & $dumpbin.FullName /dependents dist-s01/dotorca-s01.exe | Out-File dist-s01/pe-imports.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: dotOrcA-S01
+          path: dist-s01/
+          if-no-files-found: error
