@@ -158,7 +158,7 @@ static int open_detail(window_state *window, uint32_t id) {
         placement.state=saved.state ? CUI_WINDOW_MAXIMIZED : CUI_WINDOW_NORMAL;
         placement.has_position=saved.has_position != 0;
     }
-    cui_app_desc desc = {.title=orca_label(L_DETAILS), .width=740, .height=640,
+    cui_app_desc desc = {.title=orca_label(L_DETAILS), .width=740, .height=760,
         .min_width=480, .min_height=340, .theme=CUI_THEME_DARK,
         .renderer=CUI_RENDERER_SOFTWARE, .continuous=false,
         .placement=placement.width ? &placement : NULL};
@@ -190,12 +190,12 @@ static float detail_height(cui_ctx *ui,const char *text,float max_height) {
         if(!e)break;
         p=e+1;
     }
-    float h=lines*size*1.5f+24.0f;
-    return h<44.0f?44.0f:(h>max_height?max_height:h);
+    float h=lines*size*1.5f+18.0f;
+    return h<36.0f?36.0f:(h>max_height?max_height:h);
 }
 static int prefix(const char *s,const char *p){return strncmp(s,p,strlen(p))==0;}
 static cui_color line_color(cui_ctx *ui,uint32_t section,const char *s) {
-    if(prefix(s,"Source file:")||prefix(s,"Source path:")||prefix(s,"源文件：")||
+    if(prefix(s,"Source:")||prefix(s,"Source file:")||prefix(s,"Source path:")||prefix(s,"源文件：")||
        prefix(s,"Destination:")||prefix(s,"目标文件：")||prefix(s,"Saved output:")||prefix(s,"已保存："))
         return cui_color_of(ui,CUI_COLOR_TEXT_SECONDARY);
     if(section==4)return cui_color_of(ui,CUI_COLOR_DANGER);
@@ -352,7 +352,7 @@ static void update_advanced_menu(window_state *w) {
 static void browse_directory(window_state *w,char *path,size_t cap) {
     BROWSEINFOW info={0};info.hwndOwner=(HWND)cui_app_native_window(w->main_app);
     info.ulFlags=BIF_RETURNONLYFSDIRS;
-    PIDLIST_ABSOLUTE id=SHBrowseForFolderW(&info);
+    LPITEMIDLIST id=SHBrowseForFolderW(&info);
     if(!id)return;
     wchar_t dir[MAX_PATH];
     if(SHGetPathFromIDListW(id,dir))WideCharToMultiByte(CP_UTF8,0,dir,-1,path,(int)cap,NULL,NULL);

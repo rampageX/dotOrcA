@@ -85,7 +85,7 @@ pub extern "C" fn orca_ui_init(system_zh: i32) -> i32 {
         }
         match read_config("directories.txt") {
             Ok(Some(s)) => if let Some((output,tools)) = s.split_once('\n') {
-                if let Ok(paths) = parse_paths(output,tools.trim_end_matches(['\r','\n'])) { app.paths = paths; }
+                if let Ok(paths) = parse_paths(output.trim_end_matches('\r'),tools.trim_end_matches(['\r','\n'])) { app.paths = paths; }
             },
             Err(e) => app.notice = message!(ConfigRead,e),
             Ok(None) => {}

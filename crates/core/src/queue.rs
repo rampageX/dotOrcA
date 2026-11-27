@@ -113,10 +113,12 @@ fn tool_pair(dir: &Path) -> Option<(PathBuf,PathBuf)> {
 }
 impl Paths {
     pub fn resolve_tools(&self, root: &Path) -> Option<(PathBuf,PathBuf)> {
+        let paths = std::env::var_os("PATH").unwrap_or_default();
+        self.resolve_tools_in(root,std::env::split_paths(&paths))
+    }
+    fn resolve_tools_in(&self, root:&Path, search:impl IntoIterator<Item=PathBuf>) -> Option<(PathBuf,PathBuf)> {
         if let Some(dir) = &self.tools { return tool_pair(dir); }
-        tool_pair(&root.join("tools")).or_else(|| {
-            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).find_map(|dir| tool_pair(&dir)))
-        })
+        tool_pair(&root.join("tools")).or_else(||search.into_iter().find_map(|dir|tool_pair(&dir)))
     }
 }
 
@@ -798,6 +800,16 @@ mod tests {
         fs::write(root.join(format!("ffprobe{}",std::env::consts::EXE_SUFFIX)),b"test").unwrap();
         assert!(paths.resolve_tools(&root).is_some());
         assert!(tool_pair(Path::new("tools")).is_none());
+        let auto=Paths::default();
+        let portable=root.join("portable");
+        assert_eq!(auto.resolve_tools_in(&portable,[root.clone()]),tool_pair(&root));
+        let bundled=portable.join("tools");
+        fs::create_dir_all(&bundled).unwrap();
+        for name in ["ffmpeg","ffprobe"] {
+            fs::write(bundled.join(format!("{name}{}",std::env::consts::EXE_SUFFIX)),b"test").unwrap();
+        }
+        assert_eq!(auto.resolve_tools_in(&portable,[root.clone()]),tool_pair(&bundled));
+        assert_eq!(paths.resolve_tools_in(&portable,[bundled]),tool_pair(&root));
         fs::remove_dir_all(root).unwrap();
     }
 
