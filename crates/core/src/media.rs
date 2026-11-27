@@ -14,6 +14,7 @@ impl Rational {
 }
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum Hdr { Pq,Hlg,DolbyVision,Sdr,Unknown }
+impl Hdr { pub fn label(self)->&'static str {match self{Self::Pq=>"PQ",Self::Hlg=>"HLG",Self::DolbyVision=>"Dolby Vision",Self::Sdr=>"SDR",Self::Unknown=>"unknown"}} }
 #[derive(Debug,Clone)]
 pub struct Stream {
     pub index: Option<u64>, pub kind: Option<String>, pub codec: Option<String>,

@@ -83,6 +83,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         &AtomicBool::new(false),
         |event| {
             let event = match event {
+                        Event::NvencOptions{caps,enabled} => { let _=(caps,enabled); },
                 Event::Source(_) => json!({"kind": "source_metadata"}),
                 Event::Plan(_) => json!({"kind": "capacity_plan"}),
                 Event::Decision(decision) => {

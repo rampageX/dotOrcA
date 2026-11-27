@@ -65,7 +65,7 @@ fn check(job: Job<'_>, route: Route, result: CheckResult) -> RequestCheck<'_> {
 fn stale_checks_cannot_authorize_a_route() {
     let media = source("yuv420p", "bt709");
     let plan = budget::plan(&media, 250_000_000, Codec::Hevc, 1920).unwrap();
-    let hardware = report(Evidence::Verified, 8);
+    let hardware = report(Evidence::Verified, 10);
     let job = Job { plan: &plan, hardware: &hardware };
     let checks = [check(job, Route::Nvenc, CheckResult::Compatible)];
     let changed = hardware.clone();
@@ -119,12 +119,12 @@ fn small_probe_only_sets_order_and_exact_request_checks_preserve_constraints() {
 fn unavailable_and_failed_hardware_do_not_fall_back_to_software() {
     let media = source("yuv420p", "bt709");
     let plan = budget::plan(&media, 200_000_000, Codec::Hevc, 1920).unwrap();
-    let unavailable = report(Evidence::NotListed, 8);
+    let unavailable = report(Evidence::NotListed, 10);
     let d = decide(Ok(&plan), &unavailable, &[]).unwrap();
     assert_eq!(d.selection, Selection::NoRoute);
     assert_eq!(d.ready_route(), None);
 
-    let mut hardware = report(Evidence::Verified, 8);
+    let mut hardware = report(Evidence::Verified, 10);
     hardware.capabilities[1].evidence = Evidence::Verified;
     let job = Job {
         plan: &plan,
@@ -152,7 +152,7 @@ fn unavailable_and_failed_hardware_do_not_fall_back_to_software() {
 
 #[test]
 fn original_budget_error_and_conflicting_format_are_preserved() {
-    let hardware = report(Evidence::Verified, 8);
+    let hardware = report(Evidence::Verified, 10);
     assert_eq!(
         decide(Err(budget::Error::UnknownDuration), &hardware, &[]).unwrap_err(),
         budget::Error::UnknownDuration

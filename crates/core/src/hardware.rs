@@ -4,6 +4,9 @@ use std::{io,path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering},time::{Dur
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
+#[cfg(all(windows,target_arch="x86_64"))]
+#[allow(unsafe_code)]
+mod nvenc_caps;
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct Adapter {pub name:Option<String>,pub instance_id:Option<String>,pub driver_version:Option<String>}
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -70,8 +73,28 @@ pub struct ToolFingerprint {
 struct Fingerprint {tool:ToolFingerprint,version:String,inventory:Inventory}
 #[derive(Debug,Clone)]
 pub struct Report {pub inventory:Inventory,pub tool_version:String,pub tool:ToolFingerprint,pub capabilities:Vec<Capability>,pub cache_hit:bool}
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub struct NvencCaps {
+    pub max_b_frames:u32,
+    pub middle_ref:bool,
+    pub lookahead:bool,
+    pub temporal_aq:bool,
+    pub ten_bit:bool,
+}
+impl NvencCaps {
+    #[cfg(all(windows,target_arch="x86_64"))]
+    fn intersection(self, other:Self)->Self {
+        Self { max_b_frames:self.max_b_frames.min(other.max_b_frames),
+            middle_ref:self.middle_ref&&other.middle_ref, lookahead:self.lookahead&&other.lookahead,
+            temporal_aq:self.temporal_aq&&other.temporal_aq, ten_bit:self.ten_bit&&other.ten_bit }
+    }
+}
 #[derive(Default)]
-pub struct Detector {cache:Option<(Fingerprint,Instant,Report)>}
+pub struct Detector {
+    cache:Option<(Fingerprint,Instant,Report)>,
+    nvenc_cache:Option<(Fingerprint,Vec<(crate::budget::Codec,NvencCaps)>)>,
+}
+
 const ENCODERS:[(&str,u8);18]=[
     ("h264_nvenc",8),("h264_nvenc",10),("hevc_nvenc",8),("hevc_nvenc",10),("av1_nvenc",8),("av1_nvenc",10),
     ("h264_qsv",8),("h264_qsv",10),("hevc_qsv",8),("hevc_qsv",10),("av1_qsv",8),("av1_qsv",10),
@@ -109,6 +132,27 @@ fn try_encoder(exe:&Path,name:&str,bits:u8,cancel:&AtomicBool)->io::Result<Capab
     Ok(Capability{encoder:name.into(),bit_depth:bits,evidence,diagnostic})
 }
 impl Detector{
+    /// Query the driver without initializing an encoder or encoding any frames.
+    /// Cache positive answers against the tool and current driver inventory.
+    pub(crate) fn nvenc_caps(&mut self,report:&Report,codec:crate::budget::Codec)->Option<NvencCaps>{
+        let key=Fingerprint{tool:report.tool.clone(),version:report.tool_version.clone(),inventory:report.inventory.clone()};
+        let cacheable=key.inventory.adapter_scan_complete && key.tool.modified.is_some() &&
+            key.inventory.adapters.iter().all(|a|a.instance_id.is_some()&&a.driver_version.is_some());
+        if self.nvenc_cache.as_ref().is_some_and(|(old,_)|old!=&key) {self.nvenc_cache=None;}
+        if let Some((_,values))=&self.nvenc_cache {
+            if let Some((_,caps))=values.iter().find(|(c,_)|*c==codec){return Some(*caps);}
+        }
+        #[cfg(all(windows,target_arch="x86_64"))]
+        let caps=nvenc_caps::query(codec);
+        #[cfg(not(all(windows,target_arch="x86_64")))]
+        let caps:Option<NvencCaps>=None;
+        if cacheable {
+            if let Some(value)=caps {
+                self.nvenc_cache.get_or_insert_with(||(key,Vec::new())).1.push((codec,value));
+            }
+        }
+        caps
+    }
     /// Discover compiled hardware encoders and present adapters without encoding.
     pub(crate) fn list_for_transcode(&mut self, exe: &Path, cancel: &AtomicBool) -> io::Result<Report> {
         let exe = std::fs::canonicalize(exe)?;

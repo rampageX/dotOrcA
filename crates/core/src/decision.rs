@@ -145,7 +145,7 @@ fn candidate<'a>(job: Job<'a>, route: Route, checks: &[RequestCheck<'a>]) -> Can
     let small_probe = job.hardware.capabilities.iter().find(|probe| {
         route != Route::Software
             && probe.encoder == encoder
-            && Some(u64::from(probe.bit_depth)) == job.plan.source.bit_depth
+            && Some(u64::from(probe.bit_depth)) == job.plan.output_depth()
     });
     let request_checks: Vec<_> = checks
         .iter()

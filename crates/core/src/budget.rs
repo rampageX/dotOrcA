@@ -32,6 +32,17 @@ pub struct Plan<'a> {
     pub source: &'a Stream,
 }
 
+impl Plan<'_>{
+    /// HEVC and AV1 use 10-bit output even for 8-bit SDR input.
+    /// Do not hide invalid/unknown source bit depth from the route decision.
+    pub fn output_depth(&self)->Option<u64>{
+        match (self.codec,self.source.bit_depth){
+            (Codec::Hevc|Codec::Av1,Some(8|10))=>Some(10),
+            (_,depth)=>depth,
+        }
+    }
+}
+
 /// Only call with the closed, fully muxed output's measured file length.
 pub fn fits(limit: u64, measured: Option<u64>) -> bool {
     measured.is_some_and(|bytes| bytes > 0 && bytes <= limit)
@@ -137,6 +148,18 @@ mod tests {
              "color_transfer":"smpte2084","pix_fmt":"yuv420p10le"},
             {"codec_type":"audio","channels":2},{"codec_type":"audio","channels":1}]});
         parse("clip".into(),probe.to_string().as_bytes()).unwrap()
+    }
+    #[test]
+    fn output_depth_policy_preserves_hdr_and_promotes_sdr(){
+        let mut m=media();m.streams[0].bit_depth=Some(8);m.streams[0].hdr=Hdr::Sdr;
+        for (codec,depth) in [(Codec::H264,8),(Codec::Hevc,10),(Codec::Av1,10)]{
+            let p=plan(&m,10_000_000,codec,1280).unwrap();
+            assert_eq!(p.source.bit_depth,Some(8));assert_eq!(p.output_depth(),Some(depth));
+        }
+        m.streams[0].bit_depth=Some(10);
+        assert_eq!(plan(&m,10_000_000,Codec::H264,1280).unwrap().output_depth(),Some(10));
+        m.streams[0].bit_depth=None;
+        assert_eq!(plan(&m,10_000_000,Codec::Hevc,1280).unwrap().output_depth(),None);
     }
     #[test]
     fn allocation_and_preservation() {

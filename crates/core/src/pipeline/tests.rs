@@ -330,3 +330,16 @@ fn production_special_path_vfr_audio_and_hdr() {
     }
     assert_eq!(fs::read_dir(&root.0).unwrap().count(), 10);
 }
+
+#[test]
+fn nvenc_quality_requires_positive_caps(){
+    let has=|a:&[&str],key:&str,value:&str|a.windows(2).any(|w|w==[key,value]);
+    let unknown=nvenc_quality(None);
+    assert!(has(&unknown,"-bf","0"));
+    assert!(!unknown.contains(&"-b_ref_mode")&&!unknown.contains(&"-rc-lookahead")&&!unknown.contains(&"-temporal-aq"));
+    let t600=nvenc_quality(Some(NvencCaps{max_b_frames:0,middle_ref:false,lookahead:true,temporal_aq:true,ten_bit:true}));
+    assert!(has(&t600,"-bf","0")&&has(&t600,"-rc-lookahead","16")&&has(&t600,"-temporal-aq","1"));
+    assert!(!t600.contains(&"-b_ref_mode"));
+    let full=nvenc_quality(Some(NvencCaps{max_b_frames:4,middle_ref:true,lookahead:true,temporal_aq:true,ten_bit:true}));
+    assert!(has(&full,"-bf","3")&&has(&full,"-b_ref_mode","middle")&&has(&full,"-temporal-aq","1"));
+}

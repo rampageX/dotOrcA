@@ -2,7 +2,7 @@
 use crate::{
     budget::{self, Codec, Plan},
     decision::{self, CheckResult, Decision, Route, Selection},
-    hardware::Detector,
+    hardware::{Detector,NvencCaps},
     media::{self, Hdr, MediaInfo},
     process::{self, Request, Stop},
 };
@@ -53,6 +53,7 @@ pub enum Error {
 
 #[derive(Debug)]
 pub enum Event<'a> {
+    NvencOptions{caps:Option<NvencCaps>,enabled:bool},
     Source(&'a MediaInfo),
     Plan(&'a budget::Plan<'a>),
     Decision(&'a Decision<'a>),
@@ -195,6 +196,16 @@ fn retry_bitrate(plan: &Plan<'_>, current: u64, measured: u64) -> Option<u64> {
         .filter(|&r| r >= 1_000 && r < current)
 }
 
+fn nvenc_quality(caps:Option<NvencCaps>)->Vec<&'static str>{
+    let caps=caps.unwrap_or_default();
+    let mut args=vec!["-preset","p5","-tune","hq","-rc","vbr","-multipass","qres","-spatial-aq","1"];
+    args.extend(["-bf",match caps.max_b_frames{0=>"0",1=>"1",2=>"2",_=>"3"}]);
+    if caps.max_b_frames>=2&&caps.middle_ref{args.extend(["-b_ref_mode","middle"]);}
+    if caps.lookahead{args.extend(["-rc-lookahead","16"]);}
+    if caps.temporal_aq{args.extend(["-temporal-aq","1"]);}
+    args
+}
+
 fn encode_command(
     request: &EncodeRequest<'_>,
     source: &MediaInfo,
@@ -202,11 +213,12 @@ fn encode_command(
     clock: timeline::Clock,
     interlaced: bool,
     route: Route,
+    nvenc_caps: Option<NvencCaps>,
     rate: u64,
     path: &Path,
 ) -> Request {
     let planar = route == Route::Software || route == Route::Amf;
-    let pix = match (plan.source.bit_depth, planar) {
+    let pix = match (plan.output_depth(), planar) {
         (Some(10), true) if route == Route::Software => "yuv420p10le",
         (Some(10), _) => "p010le",
         (_, true) => "yuv420p",
@@ -282,7 +294,7 @@ fn encode_command(
         ]);
     }
     match route {
-        Route::Nvenc => cmd = cmd.args(["-preset","p5","-tune","hq","-rc","vbr","-multipass","qres","-spatial-aq","1","-rc-lookahead","16"]),
+        Route::Nvenc => cmd = cmd.args(nvenc_quality(nvenc_caps)),
         Route::Amf => cmd = cmd.args(["-rc", "vbr_peak"]),
         Route::Software => {
             cmd = match plan.codec {
@@ -292,6 +304,7 @@ fn encode_command(
         }
         Route::Qsv => {}
     }
+    if plan.codec==Codec::Hevc && plan.output_depth()==Some(10){cmd=cmd.args(["-profile:v","main10"]);}
     for (option, value) in [
         ("-color_range", plan.source.color_range.as_deref()),
         ("-colorspace", plan.source.color_space.as_deref()),
@@ -547,6 +560,11 @@ fn encode_inner(
         _ => return Err(Error::HardwareRouteUnavailable),
     };
 
+    let nvenc_caps=if route==Route::Nvenc {detector.nvenc_caps(&hardware,plan.codec)}else{None};
+    if route==Route::Nvenc && plan.output_depth()==Some(10) && nvenc_caps.is_some_and(|caps|!caps.ten_bit){
+        return Err(Error::UnsupportedMedia(crate::text::en(crate::text::Msg::NvencNo10Bit)));
+    }
+    observe(Event::NvencOptions{caps:nvenc_caps,enabled:route==Route::Nvenc});
     let stage = Stage::create(&directory).map_err(|e| io_error(e, cancel))?;
     let output = stage.0.join("encoded.mp4");
     let mut rate = plan.video_bps;
@@ -559,7 +577,7 @@ fn encode_inner(
             video_bps: rate,
         });
         let mut command = encode_command(
-            request, &source, &plan, clock, interlaced, route, rate, &output,
+            request, &source, &plan, clock, interlaced, route, nvenc_caps, rate, &output,
         );
         let encoder = route.encoder(plan.codec);
         let result = if let Some(report) = progress {

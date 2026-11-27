@@ -533,6 +533,10 @@ fn observe(job: &mut Job, event: Event<'_>) {
         return;
     }
     match event {
+        Event::NvencOptions{caps,enabled} => if enabled {
+            if let Some(c)=caps { note(job,message!(NvencOptions,c.max_b_frames.min(3),if c.middle_ref&&c.max_b_frames>=2{"Middle"}else{"Off"},if c.lookahead{16}else{0},if c.temporal_aq{"On"}else{"Off"})); }
+            else {note(job,text::en(Msg::NvencUnknown).into());}
+        },
         Event::Source(source) => job.source_info = Some(text::media_summary(source)),
         Event::Plan(plan) => {
             job.target_info = Some(text::target_summary(plan));
