@@ -4,6 +4,10 @@ use crate::media::{MediaInfo, Rational, Stream};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec { H264, Hevc, Av1 }
 
+impl Codec {
+    pub fn label(self) -> &'static str { match self { Self::H264 => "H264", Self::Hevc => "HEVC", Self::Av1 => "AV1" } }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error { UnknownDuration, UnsupportedStreams, UnknownGeometry, UnknownChannels, InsufficientCapacity, RateOverflow }
 
@@ -63,27 +67,16 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
     let video_bps = u64::try_from(rate).map_err(|_| Error::RateOverflow)?;
     if video_bps == 0 { return Err(Error::InsufficientCapacity); }
 
-    // Preserve source geometry whenever it meets the user's maximum.
-    // Only oversized sources enter the existing downscale heuristic.
-    // 1/20 bit per pixel per frame is a heuristic, not a quality guarantee.
+    // Respect the chosen maximum, without an additional BPP-driven drop.
+    // The secondary BPP policy is deferred until its quality targets are reviewed.
     let long = w.max(h);
     let cap = u64::from(max_long_edge);
     let rate = source.avg_rate.filter(|r| r.numerator > 0 && r.denominator > 0);
-    let (width,height) = if long <= cap {
-        (w,h)
-    } else {
-        let mut edges = std::iter::once(cap).chain([3840,2560,1920,1280,960,640,426,256].into_iter().filter(|&n| n < cap));
-        loop {
-            let edge = edges.next().ok_or(Error::InsufficientCapacity)?;
-            let scale = |side| ((u128::from(side) * u128::from(edge) / u128::from(long)) as u64) & !1;
-            let (x,y) = (scale(w),scale(h));
-            if x < 2 || y < 2 { return Err(Error::UnknownGeometry); }
-            if rate.is_none_or(|r| {
-                let needed = u128::from(x) * u128::from(y) * u128::from(r.numerator);
-                let available = (u128::from(video_bps) * u128::from(r.denominator)).saturating_mul(20);
-                needed <= available
-            }) { break (x,y); }
-        }
+    let (width,height) = if long <= cap { (w,h) } else {
+        let scale = |side| ((u128::from(side) * u128::from(cap) / u128::from(long)) as u64) & !1;
+        let (x,y) = (scale(w),scale(h));
+        if x < 2 || y < 2 { return Err(Error::UnknownGeometry); }
+        (x,y)
     };
     Ok(Plan { limit_bytes: limit, duration_us: duration, audio_bps, audio_bytes,
         mux_reserve_bytes: mux, video_bytes, video_bps, codec, width, height,
@@ -123,6 +116,17 @@ mod tests {
         for actual in [None,Some(0),Some(p.limit_bytes+1)] { assert!(!fits(p.limit_bytes,actual)); }
     }
     #[test]
+    fn interlaced_1080_to_1280_does_not_drop_to_960() {
+        let probe = json!({"format":{"duration":"30"},"streams":[
+            {"codec_type":"video","width":1920,"height":1080,"avg_frame_rate":"30000/1001","field_order":"tb","color_transfer":"smpte2084","pix_fmt":"yuv420p10le"},
+            {"codec_type":"audio","channels":2}]});
+        let m = parse("clip".into(),probe.to_string().as_bytes()).unwrap();
+        for codec in [Codec::H264,Codec::Hevc,Codec::Av1] {
+            let p = plan(&m,5_117_000,codec,1280).unwrap();
+            assert_eq!((p.width,p.height),(1280,720));
+        }
+    }
+    #[test]
     fn limits_and_unknowns() {
         let mut m = media();
         assert_eq!(plan(&m,1,Codec::Av1,1920).unwrap_err(),Error::InsufficientCapacity);
@@ -158,7 +162,7 @@ mod tests {
             let p = plan(&m,251_382_000,codec,2560).unwrap();
             assert_eq!((p.width,p.height),(2560,1440));
             let p = plan(&m,10_000_000,codec,2560).unwrap();
-            assert!(p.width < 2560);
+            assert_eq!((p.width,p.height),(2560,1440));
         }
         m.streams[0].width = Some(1071);
         m.streams[0].height = Some(1920);

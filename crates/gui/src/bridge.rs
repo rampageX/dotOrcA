@@ -4,7 +4,7 @@ use orca_core::{
     budget::Codec,
     localized, message,
     text::{self, Language, Msg},
-    queue::{Job, Phase, Queue, Settings, Target},
+    queue::{Job, Paths, Phase, Queue, Settings, Target},
 };
 use std::{cell::RefCell, ffi::c_char, fs, io, path::{Path, PathBuf}, ptr, sync::Arc};
 
@@ -14,6 +14,7 @@ struct Gui {
     snapshot: Vec<Arc<Job>>,
     notice: String,
     language: Language,
+    paths: Paths,
 }
 
 impl Gui {
@@ -82,6 +83,13 @@ pub extern "C" fn orca_ui_init(system_zh: i32) -> i32 {
             Err(e) => app.notice = message!(ConfigRead,e),
             Ok(None) => {}
         }
+        match read_config("directories.txt") {
+            Ok(Some(s)) => if let Some((output,tools)) = s.split_once('\n') {
+                if let Ok(paths) = parse_paths(output,tools.trim_end_matches(['\r','\n'])) { app.paths = paths; }
+            },
+            Err(e) => app.notice = message!(ConfigRead,e),
+            Ok(None) => {}
+        }
         i32::from(app.language == Language::Zh)
     })
 }
@@ -112,10 +120,10 @@ impl Placement {
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn orca_load_placement(out: *mut Placement) -> i32 {
+pub unsafe extern "C" fn orca_load_placement(kind: i32, out: *mut Placement) -> i32 {
     if out.is_null() || !out.is_aligned() { return -1; }
     boundary(|app| {
-        match read_config("details-placement.txt") {
+        match read_config(if kind == 0 { "main-placement.txt" } else { "details-placement.txt" }) {
             Ok(Some(s)) => {
                 let Ok(values) = s.split_whitespace().map(str::parse::<i32>).collect::<Result<Vec<_>,_>>() else { return 0; };
                 let [x,y,width,height,state,has_position] = values.as_slice() else { return 0; };
@@ -130,14 +138,82 @@ pub unsafe extern "C" fn orca_load_placement(out: *mut Placement) -> i32 {
     })
 }
 #[no_mangle]
-pub unsafe extern "C" fn orca_save_placement(value: *const Placement) -> i32 {
+pub unsafe extern "C" fn orca_save_placement(kind: i32, value: *const Placement) -> i32 {
     if value.is_null() || !value.is_aligned() { return -1; }
     boundary(|app| {
         let p = unsafe { value.read() };
         if !p.valid() { return 0; }
-        match save_config("details-placement.txt", &format!("{} {} {} {} {} {}\n",p.x,p.y,p.width,p.height,p.state,p.has_position)) {
+        match save_config(if kind == 0 { "main-placement.txt" } else { "details-placement.txt" }, &format!("{} {} {} {} {} {}\n",p.x,p.y,p.width,p.height,p.state,p.has_position)) {
             Ok(()) => 1,
             Err(e) => { app.notice = message!(ConfigError,e); 0 }
+        }
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UiSettings { mib:[c_char;24], percent:[c_char;24], mode:i32, codec:i32, resolution:i32 }
+fn settings_valid(mib:&str, percent:&str, mode:i32, codec:i32, resolution:i32) -> bool {
+    !mib.is_empty() && !percent.is_empty() && mib.len()<24 && percent.len()<24
+        && mib.bytes().all(|b|b.is_ascii_digit()) && percent.bytes().all(|b|b.is_ascii_digit())
+        && (0..=1).contains(&mode) && (0..=2).contains(&codec) && (0..=3).contains(&resolution)
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_load_settings(out:*mut UiSettings) -> i32 {
+    if out.is_null() || !out.is_aligned() { return -1; }
+    boundary(|app| {
+        let s = match read_config("settings.txt") { Ok(Some(s))=>s, Ok(None)=>return 0, Err(e)=>{app.notice=message!(ConfigRead,e);return 0;} };
+        let parts:Vec<_>=s.split_whitespace().collect();
+        let [mib,pct,mode,codec,res]=parts.as_slice() else {return 0;};
+        let (Ok(mode),Ok(codec),Ok(resolution))=(mode.parse::<i32>(),codec.parse::<i32>(),res.parse::<i32>()) else {return 0;};
+        if !settings_valid(mib,pct,mode,codec,resolution) { return 0; }
+        let mut v=UiSettings{mib:[0;24],percent:[0;24],mode,codec,resolution};
+        unsafe { write_text(v.mib.as_mut_ptr(),24,mib);write_text(v.percent.as_mut_ptr(),24,pct);out.write(v); }
+        1
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_save_settings(value:*const UiSettings) -> i32 {
+    if value.is_null() || !value.is_aligned() {return -1;}
+    boundary(|app| {
+        let v=unsafe{value.read()};
+        let parse=|buf:&[c_char;24]| -> Option<String> {
+            let end=buf.iter().position(|&c|c==0)?;
+            String::from_utf8(buf[..end].iter().map(|&c|c as u8).collect()).ok()
+        };
+        let (Some(mib),Some(pct))=(parse(&v.mib),parse(&v.percent)) else{return 0;};
+        if !settings_valid(&mib,&pct,v.mode,v.codec,v.resolution) {return 0;}
+        match save_config("settings.txt",&format!("{} {} {} {} {}\n",mib,pct,v.mode,v.codec,v.resolution)) {
+            Ok(())=>1,Err(e)=>{app.notice=message!(ConfigError,e);0}
+        }
+    })
+}
+fn parse_paths(output:&str,tools:&str) -> Result<Paths,()> {
+    let parse=|s:&str| -> Result<Option<PathBuf>,()> {
+        if s.is_empty(){return Ok(None);}
+        if s.chars().any(char::is_control) || !Path::new(s).is_absolute(){return Err(());}
+        Ok(Some(PathBuf::from(s)))
+    };
+    Ok(Paths{output:parse(output)?,tools:parse(tools)?})
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_get_directory(kind:i32,out:*mut c_char,cap:usize) -> i32 {
+    boundary(|app| {
+        let path=if kind==0 {&app.paths.output} else {&app.paths.tools};
+        let s=path.as_deref().map(|p|p.to_string_lossy()).unwrap_or_default();
+        i32::from(unsafe{write_text(out,cap,&s)})
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn orca_set_directories(output:*const c_char,on:usize,tools:*const c_char,tn:usize) -> i32 {
+    boundary(|app| {
+        let out=if on==0 {""} else {match unsafe{utf8(output,on,131072)}{Ok(v)=>v,Err(_)=>return 0}};
+        let tool=if tn==0 {""} else {match unsafe{utf8(tools,tn,131072)}{Ok(v)=>v,Err(_)=>return 0}};
+        let Ok(paths)=parse_paths(out,tool) else{return 0;};
+        if paths.tools.is_some() && paths.resolve_tools(Path::new("")).is_none(){return 0;}
+        match save_config("directories.txt",&format!("{out}\n{tool}\n")){
+            Ok(())=>{app.paths=paths;app.notice.clear();1},
+            Err(e)=>{app.notice=message!(ConfigError,e);0}
         }
     })
 }
@@ -216,7 +292,8 @@ pub unsafe extern "C" fn orca_start(
                 1 => Settings::percentage(value, codec, edge)?,
                 _ => return Err(text::en(Msg::InvalidMode).into()),
             };
-            app.queue()?.start(settings)?;
+            let paths = app.paths.clone();
+            app.queue()?.start_with_paths(settings,paths)?;
             Ok::<_, String>(())
         })();
         match started {
@@ -384,7 +461,7 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
             let target = target_text(job,lang).unwrap_or_default();
             status.push_str(&format!("  |  {}",localized!(lang,TargetStatus,target)));
             if job.phase != Phase::Skipped {
-                status.push_str(&format!("  |  {:?}  |  {}",settings.codec(),localized!(lang,MaxStatus,settings.max_long_edge())));
+                status.push_str(&format!("  |  {}  |  {}",settings.codec().label(),localized!(lang,MaxStatus,settings.max_long_edge())));
             } else {
                 status.push_str(&format!("  |  {}",text::literal(lang,Msg::OriginalRetained)));
             }
@@ -415,7 +492,7 @@ fn detail_section(job: &Job, lang: Language, section: u32) -> String {
         }
         1 => {
             if let Some(target) = target_text(job,lang) { lines.push(localized!(lang,TargetStatus,target)); }
-            if let Some(settings) = job.settings { lines.push(format!("{:?} | {}",settings.codec(),localized!(lang,MaxStatus,settings.max_long_edge()))); }
+            if let Some(settings) = job.settings { lines.push(format!("{} | {}",settings.codec().label(),localized!(lang,MaxStatus,settings.max_long_edge()))); }
             if let Some(info) = &job.target_info { lines.push(localized!(lang,Planned,text::localize(lang,info))); }
             if let Some(path) = &job.destination { lines.push(localized!(lang,Destination,path.display())); }
         }
@@ -461,6 +538,17 @@ pub unsafe extern "C" fn orca_detail(id: u32, section: u32, out: *mut c_char, ca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_values_and_paths_are_validated() {
+        assert!(settings_valid("100","50",1,2,3));
+        assert!(!settings_valid("100","50",1,2,4));
+        assert!(!settings_valid("100","bad",0,1,0));
+        assert!(parse_paths("","").is_ok());
+        assert!(parse_paths("relative","").is_err());
+        let abs=std::env::temp_dir();
+        assert_eq!(parse_paths(abs.to_str().unwrap(),"").unwrap().output,Some(abs));
+    }
 
     #[test]
     fn human_size_and_diagnostic_preserve_units_and_error_tail() {

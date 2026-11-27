@@ -99,6 +99,27 @@ impl Phase {
     }
 }
 
+/// Frozen at Start for each admitted job. Empty overrides retain portable defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Paths {
+    pub output: Option<PathBuf>,
+    pub tools: Option<PathBuf>,
+}
+fn tool_pair(dir: &Path) -> Option<(PathBuf,PathBuf)> {
+    if !dir.is_absolute() { return None; }
+    let tool = |name| dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let pair = (tool("ffmpeg"), tool("ffprobe"));
+    (pair.0.is_file() && pair.1.is_file()).then_some(pair)
+}
+impl Paths {
+    pub fn resolve_tools(&self, root: &Path) -> Option<(PathBuf,PathBuf)> {
+        if let Some(dir) = &self.tools { return tool_pair(dir); }
+        tool_pair(&root.join("tools")).or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).find_map(|dir| tool_pair(&dir)))
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: u32,
@@ -106,6 +127,7 @@ pub struct Job {
     pub source_bytes: Option<u64>,
     pub source_size_pending: bool,
     pub settings: Option<Settings>,
+    paths: Paths,
     pub target_bytes: Option<u64>,
     pub phase: Phase,
     pub encoder: Option<&'static str>,
@@ -133,6 +155,7 @@ impl Job {
             source_bytes: None,
             source_size_pending: true,
             settings: None,
+            paths: Paths::default(),
             target_bytes: None,
             phase: Phase::Waiting,
             encoder: None,
@@ -269,6 +292,10 @@ impl Queue {
     }
 
     pub fn start(&self, settings: Settings) -> Result<(), &'static str> {
+        self.start_with_paths(settings, Paths::default())
+    }
+
+    pub fn start_with_paths(&self, settings: Settings, paths: Paths) -> Result<(), &'static str> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closing {
             return Err(text::en(Msg::WorkerUnavailable));
@@ -280,6 +307,7 @@ impl Queue {
             if entry.view.phase == Phase::Waiting {
                 let job = Arc::make_mut(&mut entry.view);
                 job.settings = Some(settings);
+                job.paths = paths.clone();
                 job.phase = Phase::Ready;
             }
         }
@@ -583,11 +611,7 @@ fn output_path(dir: &Path, source: &Path, settings: Settings) -> PathBuf {
         Target::Bytes(bytes) => format!("{}M", bytes / 1_048_576),
         Target::Percent(percent) => format!("{percent}%"),
     };
-    let codec = match settings.codec() {
-        Codec::H264 => "H264",
-        Codec::Hevc => "HEVC",
-        Codec::Av1 => "AV1",
-    };
+    let codec = settings.codec().label();
     name.push(format!("_{target}_{codec}_{}.MP4", settings.max_long_edge()));
     dir.join(name)
 }
@@ -628,7 +652,7 @@ fn encode(
         if limit == 0 {
             return Err(pipeline::Error::UnsupportedMedia(text::en(Msg::ZeroLimit)));
         }
-        let dir = root.join("output");
+        let dir = job.paths.output.clone().unwrap_or_else(||root.join("output"));
         fs::create_dir_all(&dir).map_err(|e| {
             pipeline::Error::Io(io::Error::new(
                 e.kind(),
@@ -644,20 +668,11 @@ fn encode(
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(pipeline::Error::Io(e)),
         }
-        let tool = |name: &str| {
-            root.join("tools")
-                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-        };
-        let ffmpeg = tool("ffmpeg");
-        let ffprobe = tool("ffprobe");
-        for path in [&ffmpeg, &ffprobe] {
-            if !path.is_file() {
-                return Err(pipeline::Error::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    message!(MissingTool, path.display()),
-                )));
-            }
-        }
+        let (ffmpeg,ffprobe) = job.paths.resolve_tools(root).ok_or_else(|| {
+            let dir = job.paths.tools.clone().unwrap_or_else(||root.join("tools"));
+            pipeline::Error::Io(io::Error::new(io::ErrorKind::NotFound,
+                message!(MissingTool, dir.display())))
+        })?;
         let request = EncodeRequest {
                 source: &job.source,
                 destination: &destination,
@@ -771,6 +786,20 @@ mod tests {
         sync::{mpsc, Mutex},
         time::Instant,
     };
+
+    #[test]
+    fn tool_pair_requires_both_and_an_absolute_directory() {
+        let root = std::env::temp_dir().join(format!("orca-tool-pair-{}",std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let paths = Paths { tools: Some(root.clone()), output: None };
+        fs::write(root.join(format!("ffmpeg{}",std::env::consts::EXE_SUFFIX)),b"test").unwrap();
+        assert!(paths.resolve_tools(&root).is_none());
+        fs::write(root.join(format!("ffprobe{}",std::env::consts::EXE_SUFFIX)),b"test").unwrap();
+        assert!(paths.resolve_tools(&root).is_some());
+        assert!(tool_pair(Path::new("tools")).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn settings() -> Settings {
         Settings::new(1, Codec::H264, 256).unwrap()
