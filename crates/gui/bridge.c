@@ -18,6 +18,7 @@ typedef struct {
     int32_t percent;
     char name[1024];
     char status[512];
+    char video[512];
 } orca_job_row;
 
 extern int32_t orca_add_path(const char *path, size_t path_len);
@@ -71,6 +72,10 @@ typedef struct {
     bool advanced_error;
     char output_dir[DIR_CAP],tools_dir[DIR_CAP];
     WNDPROC old_proc;
+    uint32_t last_row_click;
+    ULONGLONG last_row_click_time;
+    POINT last_row_click_pos;
+    bool row_click_seen;
 } window_state;
 
 /* No font bundled: read a local Windows font by a wide filesystem path.
@@ -276,7 +281,25 @@ static void tick_detail(window_state *window) {
     cui_end_frame(ui);
 }
 
-static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
+static bool rect_has(cui_rect r, cui_vec2 p) {
+    return r.w > 0 && r.h > 0 && p.x >= r.x && p.y >= r.y && p.x < r.x+r.w && p.y < r.y+r.h;
+}
+static void row_click(cui_ctx *ui, window_state *w, uint32_t id) {
+    POINT p;
+    if (!GetCursorPos(&p)) return;
+    ULONGLONG now=GetTickCount64();
+    w->row_click_seen=true;
+    if (w->last_row_click==id && now-w->last_row_click_time<=GetDoubleClickTime() &&
+        labs(p.x-w->last_row_click_pos.x)<=GetSystemMetrics(SM_CXDOUBLECLK)/2 &&
+        labs(p.y-w->last_row_click_pos.y)<=GetSystemMetrics(SM_CYDOUBLECLK)/2) {
+        w->last_row_click=0;
+        w->callback_error=!open_detail(w,id);
+        cui_request_redraw(ui);
+    } else {
+        w->last_row_click=id;w->last_row_click_time=now;w->last_row_click_pos=p;
+    }
+}
+static void draw_job(cui_ctx *ui, window_state *window, uint32_t index, cui_rect viewport) {
     orca_job_row job;
     if (orca_row(index, &job, sizeof(job)) != 1) {
         window->callback_error = 1;
@@ -284,13 +307,18 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
     }
 
     cui_push_id_int(ui, (int)job.id);
-    cui_column(ui, .width = CUI_FILL, .pad = 12, .gap = 6, .bg = CUI_COLOR_SURFACE) {
+    cui_vec2 mouse=cui_mouse_pos(ui);
+    cui_rect bounds=cui_get_rect(ui,cui_make_id(ui,"job-card"));
+    bool button_hit=false;
+    cui_column(ui, .id="job-card", .width = CUI_FILL, .pad = 12, .gap = 6, .bg = CUI_COLOR_SURFACE) {
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            cui_text(ui, job.name, .width = CUI_FILL, .nowrap = true, .font = CUI_FONT_MEDIUM);
+            cui_text(ui, job.name, .width = CUI_FILL, .nowrap = true, .font = CUI_FONT_MEDIUM,
+                     .color=(job.flags & 4u)?CUI_COLOR_TEXT_MUTED:CUI_COLOR_FOREGROUND);
             if (cui_button(ui, orca_label(L_DETAILS))) {
                 window->callback_error = !open_detail(window,job.id);
                 cui_request_redraw(ui);
             }
+            button_hit=rect_has(cui_last_rect(ui),mouse);
             if (job.flags & 2u) {
                 if (cui_button(ui, orca_label(L_RESET))) {
                     if (window->detail && window->detail->id == job.id) close_detail(window);
@@ -299,13 +327,18 @@ static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
             } else if (cui_button(ui, orca_label(L_CANCEL), .disabled = (job.flags & 1u) == 0)) {
                 action(ui, window, CANCEL, job.id);
             }
+            button_hit=button_hit || rect_has(cui_last_rect(ui),mouse);
         }
+        if(job.video[0]) cui_text(ui,job.video,.width=CUI_FILL,.color=CUI_COLOR_TEXT_SECONDARY);
         cui_secondary(ui, job.status);
         if (job.percent >= 0) {
             cui_progress(ui, (float)job.percent / 100.0f, .width = CUI_FILL,
                          .label = orca_label(L_ENCODE_PASS), .show_value = true);
         }
     }
+    if (!button_hit && !window->confirm_clear_all && !window->advanced &&
+        cui_mouse_clicked(ui,CUI_MOUSE_LEFT) && rect_has(viewport,mouse) && rect_has(bounds,mouse))
+        row_click(ui,window,job.id);
     cui_pop_id(ui);
 }
 
@@ -417,9 +450,12 @@ static void frame(cui_ctx *ui, void *user) {
         if (window->font_tried && !window->font_ok) {
             cui_secondary(ui, orca_label(L_FONT_ERROR));
         }
+        cui_rect viewport=cui_get_rect(ui,cui_make_id(ui,"queue"));
+        window->row_click_seen=false;
         cui_scroll(ui, .id = "queue", .width = CUI_FILL, .height = CUI_FILL, .gap = 8) {
-            for (uint32_t i = 0; i < count; ++i) draw_job(ui, window, i);
+            for (uint32_t i = 0; i < count; ++i) draw_job(ui, window, i,viewport);
         }
+        if(cui_mouse_clicked(ui,CUI_MOUSE_LEFT) && !window->row_click_seen) window->last_row_click=0;
         cui_text(ui, busy < 0 || window->callback_error ? orca_label(L_QUEUE_ERROR) : status, .width = CUI_FILL);
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
             if (cui_button(ui, orca_label(L_START), .variant = CUI_BUTTON_PRIMARY, .disabled = !count)) {
@@ -588,7 +624,7 @@ int orca_cui_self_test(void) {
     close_detail(&window);
     result = 13;
     if (orca_action(CANCEL, b.id) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
-        !strstr(status, "1 cancelled")) goto done;
+        !strstr(status, "1 cancelled") || orca_row(1,&b,sizeof(b)) != 1 || !(b.flags & 4u)) goto done;
     if (orca_action(CLEAR_FINISHED, 0) != 1 || orca_frame(status, sizeof(status), &count) < 0 ||
         count != 1) goto done;
     result = 16;

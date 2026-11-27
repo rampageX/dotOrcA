@@ -128,6 +128,9 @@ pub struct Job {
     pub source: PathBuf,
     pub source_bytes: Option<u64>,
     pub source_size_pending: bool,
+    pub source_meta_pending: bool,
+    pub source_video: Option<String>,
+    pub source_meta_error: Option<String>,
     pub settings: Option<Settings>,
     paths: Paths,
     pub target_bytes: Option<u64>,
@@ -157,6 +160,9 @@ impl Job {
             source: source.into(),
             source_bytes: None,
             source_size_pending: true,
+            source_meta_pending: true,
+            source_video: None,
+            source_meta_error: None,
             settings: None,
             paths: Paths::default(),
             target_bytes: None,
@@ -210,7 +216,7 @@ pub struct Queue {
 
 impl Queue {
     pub fn portable(root: PathBuf) -> io::Result<Self> {
-        Self::spawn(move |shared| {
+        Self::spawn_with_preview(Some(root.clone()), move |shared| {
             let parallelism = crate::hardware::queue_parallelism(&crate::hardware::inventory());
             {
                 let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,7 +236,15 @@ impl Queue {
         })
     }
 
+    #[cfg(test)]
     fn spawn(
+        run: impl FnOnce(&Shared) + Send + std::panic::UnwindSafe + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_preview(None, run)
+    }
+
+    fn spawn_with_preview(
+        preview_root: Option<PathBuf>,
         run: impl FnOnce(&Shared) + Send + std::panic::UnwindSafe + 'static,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
@@ -259,8 +273,8 @@ impl Queue {
         // encoding is active. It holds no lock during filesystem access.
         let sizes = Arc::clone(&shared);
         if let Err(error) = thread::Builder::new()
-            .name("dotOrcA source sizes".into())
-            .spawn(move || read_source_sizes(&sizes))
+            .name("dotOrcA source metadata".into())
+            .spawn(move || read_source_metadata(&sizes, preview_root.as_deref()))
         {
             Self { shared, worker }.shutdown();
             return Err(error);
@@ -269,6 +283,10 @@ impl Queue {
     }
 
     pub fn add(&self, source: &Path) -> Result<u32, &'static str> {
+        self.add_with_paths(source, Paths::default())
+    }
+
+    pub fn add_with_paths(&self, source: &Path, paths: Paths) -> Result<u32, &'static str> {
         if !source.is_absolute() || source.file_stem().is_none() {
             return Err(text::en(Msg::AbsolutePath));
         }
@@ -287,8 +305,10 @@ impl Queue {
             .checked_add(1)
             .ok_or(text::en(Msg::IdExhausted))?;
         let id = state.next;
+        let mut job = Job::waiting(id, source);
+        job.paths = paths;
         state.entries.push(Entry {
-            view: Arc::new(Job::waiting(id, source)),
+            view: Arc::new(job),
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.shared.size_ready.notify_one();
@@ -354,9 +374,11 @@ impl Queue {
             .ok_or(text::en(Msg::ResetFinished))?;
         let next = state.next.checked_add(1).ok_or(text::en(Msg::IdExhausted))?;
         let source = state.entries[index].view.source.clone();
+        let mut job = Job::waiting(next, &source);
+        job.paths = state.entries[index].view.paths.clone();
         state.next = next;
         state.entries[index] = Entry {
-            view: Arc::new(Job::waiting(next, &source)),
+            view: Arc::new(job),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         self.shared.size_ready.notify_one();
@@ -407,25 +429,52 @@ impl Queue {
     }
 }
 
-fn read_source_sizes(shared: &Shared) {
+fn read_source_metadata(shared: &Shared, root: Option<&Path>) {
     loop {
-        let (id, path) = {
+        let (view, cancel) = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if state.closing {
-                    return;
-                }
-                if let Some(entry) = state.entries.iter().find(|e| e.view.source_size_pending) {
-                    break (entry.view.id, entry.view.source.clone());
+                if state.closing { return; }
+                if let Some(entry) = state.entries.iter().find(|e| e.view.source_size_pending || e.view.source_meta_pending) {
+                    break (Arc::clone(&entry.view), Arc::clone(&entry.cancel));
                 }
                 state = shared.size_ready.wait(state).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let bytes = fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len());
-        Updates { shared, id }.modify(|job| {
+        let update = Updates { shared, id: view.id };
+        let bytes = fs::metadata(&view.source).ok().filter(|m| m.is_file()).map(|m| m.len());
+        let pending = update.modify(|job| {
             if job.source_size_pending {
                 job.source_bytes = bytes;
                 job.source_size_pending = false;
+            }
+            job.source_meta_pending
+        }).unwrap_or(false);
+        if !pending { continue; }
+        // Presentation only. A single metadata worker never holds the queue
+        // lock during FFprobe; Start does not wait for it. Production retains
+        // its fresh authoritative source probe and overrides this preview.
+        let result = if cancel.load(Ordering::Acquire) || root.is_none() || bytes.is_none() {
+            None
+        } else {
+            let root = root.expect("checked preview root");
+            Some(match view.paths.resolve_tools(root) {
+                Some((_, probe)) => crate::media::probe(&probe, &view.source, &cancel)
+                    .map_err(|e| e.to_string()),
+                None => Err(message!(MissingTool,view.paths.tools.as_deref().unwrap_or(&root.join("tools")).display())),
+            })
+        };
+        let (info, video, error) = match result {
+            Some(Ok(info)) => (Some(text::media_summary(&info)), text::video_summary(&info), None),
+            Some(Err(e)) => (None, None, Some(message!(SourceMetadata,e))),
+            None => (None, None, None),
+        };
+        update.modify(|job| {
+            if job.source_meta_pending {
+                job.source_meta_pending = false;
+                job.source_info = info;
+                job.source_video = video;
+                job.source_meta_error = error;
             }
         });
     }
@@ -438,6 +487,7 @@ fn cancel_entry(entry: &mut Entry) {
     }
     entry.cancel.store(true, Ordering::Release);
     let view = Arc::make_mut(&mut entry.view);
+    view.source_meta_pending = false;
     if matches!(phase, Phase::Waiting | Phase::Ready) {
         view.phase = Phase::Cancelled;
         view.detail.push(text::en(Msg::CancelBefore).into());
@@ -537,7 +587,12 @@ fn observe(job: &mut Job, event: Event<'_>) {
             if let Some(c)=caps { note(job,message!(NvencOptions,c.max_b_frames.min(3),if c.middle_ref&&c.max_b_frames>=2{"Middle"}else{"Off"},if c.lookahead{16}else{0},if c.temporal_aq{"On"}else{"Off"})); }
             else {note(job,text::en(Msg::NvencUnknown).into());}
         },
-        Event::Source(source) => job.source_info = Some(text::media_summary(source)),
+        Event::Source(source) => {
+            job.source_info = Some(text::media_summary(source));
+            job.source_video = text::video_summary(source);
+            job.source_meta_pending = false;
+            job.source_meta_error = None;
+        }
         Event::Plan(plan) => {
             job.target_info = Some(text::target_summary(plan));
             if plan.low_bpp {note(job,text::en(Msg::LowBpp).into());}
@@ -771,6 +826,10 @@ fn encode(
             // being written; never replace its newer metadata with a stale copy.
             completed.source_bytes = job.source_bytes;
             completed.source_size_pending = job.source_size_pending;
+            completed.source_meta_pending = job.source_meta_pending;
+            completed.source_info = job.source_info.clone();
+            completed.source_video = job.source_video.clone();
+            completed.source_meta_error = job.source_meta_error.clone();
             *job = completed;
         });
     }

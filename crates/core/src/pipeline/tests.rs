@@ -81,6 +81,26 @@ fn production_special_path_vfr_audio_and_hdr() {
         ],
         &source,
     );
+    // The actual special-character fixture must have metadata while still
+    // queued, without starting any encoder.
+    let queue=crate::queue::Queue::portable(root.0.clone()).unwrap();
+    queue.add_with_paths(&source,crate::queue::Paths{
+        tools:Some(ffprobe.parent().unwrap().into()),output:None
+    }).unwrap();
+    let deadline=Instant::now()+Duration::from_secs(40);
+    loop {
+        let jobs=queue.snapshot();
+        let job=&jobs[0];
+        assert_eq!(job.phase,crate::queue::Phase::Waiting);
+        if !job.source_meta_pending {
+            assert!(job.source_info.as_deref().unwrap_or_default().contains("320 × 180"),"{job:?}");
+            assert!(job.source_video.as_deref().unwrap_or_default().contains("320 × 180"),"{job:?}");
+            break;
+        }
+        assert!(Instant::now()<deadline,"{job:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    queue.shutdown();
     let mut request = EncodeRequest {
         source: &source,
         destination: &destination,
@@ -107,7 +127,9 @@ fn production_special_path_vfr_audio_and_hdr() {
             destination: &promoted,
             ffmpeg: request.ffmpeg,
             ffprobe: request.ffprobe,
-            limit_bytes: request.limit_bytes,
+            // This fixture checks depth, not the tight-capacity retry policy
+            // already covered by the original regression cases.
+            limit_bytes: 300_000,
             codec,
             max_long_edge: request.max_long_edge,
             timeout: request.timeout,

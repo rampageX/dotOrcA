@@ -4,7 +4,7 @@ use std::ffi::CStr;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Language { #[default] En, Zh }
 #[derive(Clone, Copy)]
-pub enum Msg { PositiveMiB, PercentRange, InvalidResolution, WorkerStopped, AbsolutePath, WorkerUnavailable, WaitStop, QueueFull, IdExhausted, WaitClear, QueueUnavailable, ResetFinished, CancelBefore, SoftwareFallback, RouteReason, NoCompatible, Preflight, EncoderFailed, Oversize, SourceEmpty, ZeroLimit, MakeOutput, MissingTool, OutputMetadata, CancelDuring, SourceWithin, SourceRetained, Exists, ExistsRetained, ProcessFailed, HardwareUnavailable, AccessDenied, LogFailed, Unknown, UnknownDepth, UnknownFps, UnknownPixel, Bwdif, OriginalCadence, Depth, Fps, TargetSummary, Container, Video, Color, Audio, Subtitle, LocateExe, ExeDirectory, StartQueue, InvalidLength, InvalidUtf8, WholeTarget, InvalidCodec, InvalidMode, QueueSummary, Clearing, Reading, DiagnosticShort, Queued, WaitingWorker, Inspecting, Checking, Encoding, Validating, Retrying, Cancelling, Saved, Skipped, Failed, Cancelled, SourceStatus, SizeUnknown, TargetStatus, MaxStatus, OriginalRetained, SettingsStart, RetryStatus, OutputStatus, ErrorHeader, Failure, SkipDetail, SourceSize, SourcePath, NoSourceMeta, Planned, Destination, SavedOutput, NoOutputMeta, NotAvailable, ConfigError, ConfigRead, NoTimeBase, TimeBaseLarge, EmptyOutput, MissingStreams, MissingFormat, InvalidStream, NotRegular, ProbeLimit, DetectCancelled, AbsoluteFfmpeg, AbsoluteExe, ExeExtension, CancelledLaunch, StdoutPanic, StderrPanic, DiskFull, InvalidDestination, SourceChanged, DynamicHdr, CapacityExceeded, UnsupportedMedia, UnknownDuration, UnsupportedStreams, UnknownGeometry, UnknownChannels, InsufficientCapacity, RateOverflow, NoRoute, IoError, EncodingToolQuery, ProbeError, HardwareNotListed, AdapterAbsent, SuspendedThreads, InitialThread, ThreadOwner, SuspendCount, LowBpp, AdaptiveScale, SpeedStatus, NvencNo10Bit, NvencOptions, NvencUnknown }
+pub enum Msg { PositiveMiB, PercentRange, InvalidResolution, WorkerStopped, AbsolutePath, WorkerUnavailable, WaitStop, QueueFull, IdExhausted, WaitClear, QueueUnavailable, ResetFinished, CancelBefore, SoftwareFallback, RouteReason, NoCompatible, Preflight, EncoderFailed, Oversize, SourceEmpty, ZeroLimit, MakeOutput, MissingTool, OutputMetadata, CancelDuring, SourceWithin, SourceRetained, Exists, ExistsRetained, ProcessFailed, HardwareUnavailable, AccessDenied, LogFailed, Unknown, UnknownDepth, UnknownFps, UnknownPixel, Bwdif, OriginalCadence, Depth, Fps, TargetSummary, Container, Video, Color, Audio, Subtitle, LocateExe, ExeDirectory, StartQueue, InvalidLength, InvalidUtf8, WholeTarget, InvalidCodec, InvalidMode, QueueSummary, Clearing, Reading, DiagnosticShort, Queued, WaitingWorker, Inspecting, Checking, Encoding, Validating, Retrying, Cancelling, Saved, Skipped, Failed, Cancelled, SourceStatus, SizeUnknown, TargetStatus, MaxStatus, OriginalRetained, SettingsStart, RetryStatus, OutputStatus, ErrorHeader, Failure, SkipDetail, SourceSize, SourcePath, NoSourceMeta, Planned, Destination, SavedOutput, NoOutputMeta, NotAvailable, ConfigError, ConfigRead, NoTimeBase, TimeBaseLarge, EmptyOutput, MissingStreams, MissingFormat, InvalidStream, NotRegular, ProbeLimit, DetectCancelled, AbsoluteFfmpeg, AbsoluteExe, ExeExtension, CancelledLaunch, StdoutPanic, StderrPanic, DiskFull, InvalidDestination, SourceChanged, DynamicHdr, CapacityExceeded, UnsupportedMedia, UnknownDuration, UnsupportedStreams, UnknownGeometry, UnknownChannels, InsufficientCapacity, RateOverflow, NoRoute, IoError, EncodingToolQuery, ProbeError, HardwareNotListed, AdapterAbsent, SuspendedThreads, InitialThread, ThreadOwner, SuspendCount, LowBpp, AdaptiveScale, SpeedStatus, NvencNo10Bit, NvencOptions, NvencUnknown, VideoBrief, SourceMetadata, Progressive, Interlaced, MetadataReading }
 const MESSAGES: &[(&str, &str)] = &[
     ("Enter a positive whole number of MiB within range.", "请输入范围内的正整数 MiB。"),
     ("Enter a whole percentage from 1 to 100.", "请输入 1 至 100 的整数百分比。"),
@@ -48,10 +48,10 @@ const MESSAGES: &[(&str, &str)] = &[
     ("{}-bit", "{} bit"),
     ("{} fps (average)", "{} fps（平均）"),
     ("{} | {} × {} | {} | {} | {} | Video {} kb/s | Audio tracks {}", "{} | {} × {} | {} | {} | {} | 视频 {} kb/s | 音轨数 {}"),
-    ("Container: {} | Duration: {}", "封装：{} | 时长：{}"),
-    ("Video: {} | {} × {} | {} | {} | {} | {}", "视频：{} | {} × {} | {} | {} | {} | {}"),
+    ("Container: {} | Duration: {} | Overall bitrate: {}", "封装：{} | 时长：{} | 总码率：{}"),
+    ("Video: {} | {} × {} | {} | {} | {} | {} | {} | {}", "视频：{} | {} × {} | {} | {} | {} | {} | {} | {}"),
     ("Color: {} / {} / {} / {} | Field order: {}", "色彩：{} / {} / {} / {} | 场序：{}"),
-    ("Audio: {} | {} channels | {} Hz", "音频：{} | {} 声道 | {} Hz"),
+    ("Audio: {} | {} channels | {} | {} Hz | {}", "音频：{} | {} 声道 | {} | {} Hz | {}"),
     ("Subtitle: {}", "字幕：{}"),
     ("Cannot locate EXE: {}", "无法定位程序：{}"),
     ("EXE directory is unavailable.", "程序目录不可用。"),
@@ -141,6 +141,11 @@ const MESSAGES: &[(&str, &str)] = &[
     ("NVENC does not support the requested 10-bit encoding.", "NVENC 不支持所请求的 10-bit 编码。"),
     ("NVENC: B-frames {} | B-reference {} | Lookahead {} | Temporal AQ {}", "NVENC：B 帧 {} | B 帧参考 {} | Lookahead {} | Temporal AQ {}"),
     ("NVENC capabilities unknown; optional B-frames, Lookahead and Temporal AQ disabled.", "NVENC 能力查询结果未知，已禁用可选 B 帧、Lookahead 和 Temporal AQ。"),
+    ("Source video: {} | {} × {} | {} | {} | {} | {} | {}", "源视频：{} | {} × {} | {} | {} | {} | {} | {}"),
+    ("Source metadata unavailable: {}", "无法读取源文件媒体信息：{}"),
+    ("progressive", "逐行"),
+    ("interlaced", "隔行"),
+    ("Reading source media metadata…", "正在读取源文件媒体信息…"),
 ];
 const LABELS: &[(&CStr, &CStr)] = &[
     (c"Details", c"详情"),
@@ -207,6 +212,57 @@ fn codec_label(value:&str)->&str{
         "mpeg4"=>"MPEG-4","aac"=>"AAC","ac3"=>"AC-3","eac3"=>"E-AC-3","dts"=>"DTS","truehd"=>"TrueHD","flac"=>"FLAC",
         "mp3"=>"MP3","mp2"=>"MP2","opus"=>"Opus","vorbis"=>"Vorbis","alac"=>"ALAC",other=>other}
 }
-pub fn media_summary(info: &MediaInfo) -> String { let unknown = en(Msg::Unknown); let mut lines = vec![message!(Container, info.format.as_deref().unwrap_or(unknown), info.duration_us.map_or_else(||unknown.into(),|n|format!("{:.2} s",n as f64/1_000_000.0)))]; for s in &info.streams { let codec = codec_label(s.codec.as_deref().unwrap_or(unknown)); match s.kind.as_deref() { Some("video") if !s.attached_picture => { let fps=s.avg_rate.map_or_else(||en(Msg::UnknownFps).into(),|r|message!(Fps,format!("{:.3}",r.numerator as f64/r.denominator as f64))); lines.push(message!(Video, codec, s.width.map_or_else(||"?".into(),|n|n.to_string()), s.height.map_or_else(||"?".into(),|n|n.to_string()), s.bit_depth.map_or_else(||en(Msg::UnknownDepth).into(),|n|message!(Depth,n)), fps, s.hdr.label(), s.pixel_format.as_deref().unwrap_or(en(Msg::UnknownPixel)))); lines.push(message!(Color, s.color_primaries.as_deref().unwrap_or(unknown), s.color_transfer.as_deref().unwrap_or(unknown), s.color_space.as_deref().unwrap_or(unknown), s.color_range.as_deref().unwrap_or(unknown),s.raw["field_order"].as_str().unwrap_or(unknown))); }, Some("audio") => lines.push(message!(Audio,codec,s.channels.map_or_else(||"?".into(),|n|n.to_string()),s.sample_rate.map_or_else(||"?".into(),|n|n.to_string()))), Some("subtitle")=>lines.push(message!(Subtitle,codec)), _=>{} } } lines.join("\n") }
+fn profile_name(s: &crate::media::Stream) -> String {
+    let codec = codec_label(s.codec.as_deref().unwrap_or(en(Msg::Unknown)));
+    match s.raw["profile"].as_str().filter(|p| !p.is_empty() && *p != "unknown" && *p != "N/A") {
+        Some(p) => format!("{codec} {p}"),
+        None => codec.to_owned(),
+    }
+}
+fn bitrate(v: &serde_json::Value) -> String {
+    v.as_u64().or_else(||v.as_str()?.parse::<u64>().ok()).filter(|&n|n>0)
+        .map_or_else(||en(Msg::Unknown).into(),|n|format!("{:.0} kb/s",n as f64/1000.0))
+}
+fn timecode(us: Option<u64>) -> String {
+    us.map_or_else(||en(Msg::Unknown).into(), |us| {
+        let ms=us/1000;
+        format!("{:02}:{:02}:{:02}.{:03}",ms/3_600_000,ms/60_000%60,ms/1000%60,ms%1000)
+    })
+}
+fn video_line(s: &crate::media::Stream, brief: bool) -> String {
+    let codec=profile_name(s);
+    let w=s.width.map_or_else(||"?".into(),|n|n.to_string());
+    let h=s.height.map_or_else(||"?".into(),|n|n.to_string());
+    let depth=s.bit_depth.map_or_else(||en(Msg::UnknownDepth).into(),|n|message!(Depth,n));
+    let fps=s.avg_rate.map_or_else(||en(Msg::UnknownFps).into(),|r|message!(Fps,format!("{:.3}",r.numerator as f64/r.denominator as f64)));
+    let rate=bitrate(&s.raw["bit_rate"]);
+    let scan=match s.raw["field_order"].as_str() {
+        Some("progressive")=>en(Msg::Progressive),
+        Some("tt"|"bb"|"tb"|"bt")=>en(Msg::Interlaced),
+        _=>en(Msg::Unknown),
+    };
+    let hdr=s.hdr.label();
+    if brief {message!(VideoBrief,codec,w,h,depth,fps,rate,scan,hdr)}
+    else {message!(Video,codec,w,h,depth,fps,rate,scan,hdr,s.pixel_format.as_deref().unwrap_or(en(Msg::UnknownPixel)))}
+}
+pub fn video_summary(info: &MediaInfo) -> Option<String> {
+    info.streams.iter().find(|s|s.kind.as_deref()==Some("video")&&!s.attached_picture).map(|s|video_line(s,true))
+}
+pub fn media_summary(info: &MediaInfo) -> String {
+    let unknown=en(Msg::Unknown);
+    let mut lines=vec![message!(Container,info.format.as_deref().unwrap_or(unknown),timecode(info.duration_us),bitrate(&info.raw["format"]["bit_rate"]))];
+    for s in &info.streams {
+        match s.kind.as_deref() {
+            Some("video") if !s.attached_picture => {
+                lines.push(video_line(s,false));
+                lines.push(message!(Color,s.color_primaries.as_deref().unwrap_or(unknown),s.color_transfer.as_deref().unwrap_or(unknown),s.color_space.as_deref().unwrap_or(unknown),s.color_range.as_deref().unwrap_or(unknown),s.raw["field_order"].as_str().unwrap_or(unknown)));
+            }
+            Some("audio") => lines.push(message!(Audio,profile_name(s),s.channels.map_or_else(||"?".into(),|n|n.to_string()),s.raw["channel_layout"].as_str().unwrap_or(unknown),s.sample_rate.map_or_else(||"?".into(),|n|n.to_string()),bitrate(&s.raw["bit_rate"]))),
+            Some("subtitle") => lines.push(message!(Subtitle,codec_label(s.codec.as_deref().unwrap_or(unknown)))),
+            _=>{}
+        }
+    }
+    lines.join("\n")
+}
 pub fn pipeline_error(error: pipeline::Error) -> String { use pipeline::Error as E; match error { E::Budget(e)=>en(match e { budget::Error::UnknownDuration=>Msg::UnknownDuration,budget::Error::UnsupportedStreams=>Msg::UnsupportedStreams,budget::Error::UnknownGeometry=>Msg::UnknownGeometry,budget::Error::UnknownChannels=>Msg::UnknownChannels,budget::Error::InsufficientCapacity=>Msg::InsufficientCapacity,budget::Error::RateOverflow=>Msg::RateOverflow }).into(), E::Cancelled=>en(Msg::CancelDuring).into(), E::DiskFull=>en(Msg::DiskFull).into(), E::DestinationExists=>en(Msg::Exists).into(), E::InvalidDestination=>en(Msg::InvalidDestination).into(), E::SourceChanged=>en(Msg::SourceChanged).into(), E::UnsupportedDynamicHdr=>en(Msg::DynamicHdr).into(), E::UnsupportedMedia(s)=>message!(UnsupportedMedia,s), E::Io(e)=>message!(IoError,e), E::Process(s)=>s, E::NoRoute=>en(Msg::NoRoute).into(), E::HardwareRouteUnavailable=>en(Msg::HardwareUnavailable).into(), E::CapacityExceeded{limit,measured}=>message!(CapacityExceeded,measured,limit) } }
 #[cfg(test)] mod tests { use super::*; #[test] fn known_templates_keep_values_and_raw_text() { assert_eq!(crate::media::Hdr::Sdr.label(),"SDR"); assert_eq!(crate::media::Hdr::Pq.label(),"PQ"); assert_eq!(crate::media::Hdr::Hlg.label(),"HLG"); assert_eq!(codec_label("aac"),"AAC"); assert_eq!(localize(Language::Zh,&message!(MissingTool,"C:\\unknown\\ffmpeg.exe")),"未找到 FFmpeg/FFprobe 工具组：C:\\unknown\\ffmpeg.exe（自动模式也搜索 PATH）"); assert_eq!(localize(Language::Zh,&message!(TargetSummary,"HEVC",1920,1080,"10-bit","PQ",en(Msg::OriginalCadence),1000,2)),"HEVC | 1920 × 1080 | 10 bit | PQ | 保留原帧率 | 视频 1000 kb/s | 音轨数 2"); assert_eq!(localize(Language::Zh,"arbitrary FFmpeg diagnostic"),"arbitrary FFmpeg diagnostic"); } }

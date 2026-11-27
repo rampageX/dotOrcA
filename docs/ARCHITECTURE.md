@@ -9,3 +9,5 @@ Cargo Workspace：core（纯 Rust）、gui（Rust UI adapter + C bridge）、s00
 GUI：CUI v1.5.0 固定上游 commit，MSVC static CRT，软件渲染。主窗口与独立详情窗口均在 UI 线程以各自 CUI 上下文处理，不嵌套模态循环；一个详情窗口可切换任务，通过稳定 ID 获取最新快照，任务移除或主窗口退出时销毁。五个只读分区支持选择、复制、滚动，错误和标题高亮。C ABI 传递 UTF-8；中文使用系统字体 fallback，不分发字体。默认随系统语言，用户可切换并记忆设置。原始 FFmpeg 诊断保留原文。混合 DPI 和无 CJK 字体环境仍需实机验证。
 
 长视频策略：>600s 启用 BPP 自适应，≤600s FastStart；AAC 已兼容低码率音轨可 Copy，其余保留声道按预算编码，必要时降低 AAC 码率；NVENC P5/HQ/QuarterRes/Spatial AQ/lookahead16 为候选测试参数；HEVC hvc1、自动硬解、实际倍速与低 BPP 提示。HEVC/AV1 默认 10-bit；H264 保留源位深。NVENC Windows x64 直接动态加载系统驱动，查询 SDK 12.1 Caps，不编码任何帧；多 GPU 对同编码格式取支持能力交集，未知时禁用可选增强。B 帧最多 3、Middle reference/Temporal AQ/Lookahead 仅能力确认后启用。
+
+入队后的单一后台元数据线程读取文件大小及 FFprobe 容器/流信息；只读预览通过稳定 ID 发布，取消/移除/重置不串任务，不等待预览即可开始编码。生产源探测仍为权威数据。主列表显示首个非封面视频摘要，详情显示容器和音视频/字幕流；取消文件名弱化，双击任务卡打开详情。

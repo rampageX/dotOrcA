@@ -25,3 +25,5 @@
 验收：RTX 4080 实机通过用户验收，最终发行由完整自动回归门禁控制。独立 ETA 校准、干净 Windows、真实 UNC、QSV/AMF 和逐适配器验证仍待补充。项目自有代码于 v1.0.0 发布后经作者授权采用 MIT License，见仓库根目录 LICENSE；第三方许可不变。原始发行包不重打包。
 
 候选优化：600 秒分界 BPP/FastStart、AAC copy 与紧预算降码率、NVENC P5 HQ quarter-resolution multipass spatial AQ lookahead 16、自动硬解、hvc1、实时倍速、低 BPP 提示及详情窗口消息边沿修复。硬件收益与交互等待实机验收。
+
+- 候选实机反馈：10-bit HEVC 压缩及超限重试正常（用户截图）；新增入队后台 FFprobe 源文件详情、主列表视频摘要、取消文件名弱化、双击任务卡打开非模态详情。生产保留独立实时源信息探测，预览不阻塞 Start。Windows 10-bit 软件测试素材的独立容量预算调整为 300000 字节，原有硬上限/重试回归保持不变。

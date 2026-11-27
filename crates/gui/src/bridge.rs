@@ -253,7 +253,8 @@ pub unsafe extern "C" fn orca_add_path(
     boundary(|app| {
         let added = (|| {
             let path = unsafe { utf8(path, path_len, 131_072) }?;
-            app.queue()?.add(Path::new(path))?;
+            let paths = app.paths.clone();
+            app.queue()?.add_with_paths(Path::new(path), paths)?;
             Ok::<_, String>(())
         })();
         match added {
@@ -352,7 +353,7 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
          let active = clearing || app
             .snapshot
             .iter()
-            .any(|j| j.source_size_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
+            .any(|j| j.source_size_pending || j.source_meta_pending || (!j.phase.finished() && j.phase != Phase::Waiting));
         let lang = app.language;
         let mut text = localized!(lang, QueueSummary,finished,total,slots,published,skipped,failed,finished-published-skipped-failed);
         if clearing {
@@ -423,11 +424,12 @@ fn target_text(job: &Job, lang: Language) -> Option<String> {
 #[repr(C)]
 pub struct Row {
     id: u32,
-    // Bit 0: can cancel; bit 1: terminal row (can reset).
+    // Bit 0: can cancel; bit 1: terminal row (can reset); bit 2: cancelled.
     flags: u32,
     percent: i32,
     name: [c_char; 1024],
     status: [c_char; 512],
+    video: [c_char; 512],
 }
 
 #[no_mangle]
@@ -441,10 +443,11 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
         };
         let mut row = Row {
             id: job.id,
-            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling) | (u32::from(job.phase.finished()) << 1),
+            flags: u32::from(!job.phase.finished() && job.phase != Phase::Cancelling) | (u32::from(job.phase.finished()) << 1) | (u32::from(job.phase == Phase::Cancelled) << 2),
             percent: job.progress_percent.map_or(-1, i32::from),
             name: [0; 1024],
             status: [0; 512],
+            video: [0; 512],
         };
         let name = job
             .source
@@ -477,6 +480,10 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
         unsafe {
             write_text(row.name.as_mut_ptr(), row.name.len(), &name);
             write_text(row.status.as_mut_ptr(), row.status.len(), &status);
+            let video = if let Some(s) = &job.source_video { text::localize(lang,s) }
+                else if job.source_meta_pending { text::literal(lang,Msg::MetadataReading).into() }
+                else { String::new() };
+            write_text(row.video.as_mut_ptr(), row.video.len(), &video);
             out.write(row);
         }
         1
@@ -489,7 +496,11 @@ fn detail_section(job: &Job, lang: Language, section: u32) -> String {
         0 => {
             lines.push(localized!(lang,SourceSize,source_size(job,lang)));
             lines.push(localized!(lang,SourcePath,job.source.display()));
-            lines.push(job.source_info.as_deref().map_or_else(||text::literal(lang,Msg::NoSourceMeta).into(),|s|text::lines(lang,s)));
+            lines.push(job.source_info.as_deref().map_or_else(|| {
+                if job.source_meta_pending {text::literal(lang,Msg::MetadataReading).into()}
+                else if let Some(error)=&job.source_meta_error {text::localize(lang,error)}
+                else {text::literal(lang,Msg::NoSourceMeta).into()}
+            },|s|text::lines(lang,s)));
         }
         1 => {
             if let Some(target) = target_text(job,lang) { lines.push(localized!(lang,TargetStatus,target)); }
@@ -621,7 +632,7 @@ mod tests {
             let mut reset_row = std::mem::MaybeUninit::<Row>::uninit();
             assert_eq!(orca_row(0, reset_row.as_mut_ptr(), std::mem::size_of::<Row>()), 1);
             let reset_row = reset_row.assume_init();
-            assert_eq!(reset_row.flags, 2);
+            assert_eq!(reset_row.flags, 6);
             assert_eq!(orca_action(4, reset_row.id), 1);
             assert!(orca_frame(message.as_mut_ptr(), message.len(), &mut count) >= 0);
             assert_eq!(count, 1);
