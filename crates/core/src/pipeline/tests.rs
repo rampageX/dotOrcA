@@ -290,6 +290,19 @@ fn production_special_path_vfr_audio_and_hdr() {
         .args([interlaced.as_os_str()]);
     let fixture = process::run(&fixture, &cancel).unwrap();
     assert!(fixture.status.success(), "{:?}", fixture.stderr);
+    // Reproduce the actual hardware-decoder output formats even on CI
+    // without a GPU. Use the production filter chain and strict +pix_fmt.
+    let mut info = media::probe(&ffprobe, &interlaced, &cancel).unwrap();
+    for (input, depth, output) in [("nv12",8,"p010le"),("p010le",10,"p010le")] {
+        info.streams[0].bit_depth=Some(depth);
+        let plan=budget::plan(&info,1_048_576,Codec::Hevc,256).unwrap();
+        let graph=video_filter(&plan,true,output);
+        let fixture=format!("testsrc2=size=320x180:rate=50:duration=1,tinterlace=interleave_top,scale=iw:ih:interl=1,format={input}");
+        let cmd=Request::new(&ffmpeg).args(["-hide_banner","-v","error","-xerror","-f","lavfi","-i",&fixture,
+            "-vf",&graph,"-pix_fmt",&format!("+{output}"),"-c:v","wrapped_avframe","-f","null","-"]);
+        let result=process::run(&cmd,&cancel).unwrap();
+        assert!(result.status.success(),"{input}: {}",String::from_utf8_lossy(&result.stderr.bytes));
+    }
     let progressive = root.0.join("50p with subtitles.mp4");
     request.source = &interlaced;
     request.destination = &progressive;
@@ -385,4 +398,19 @@ fn nvenc_quality_requires_positive_caps(){
     assert!(!t600.contains(&"-b_ref_mode"));
     let full=nvenc_quality(Some(NvencCaps{max_b_frames:4,middle_ref:true,lookahead:true,temporal_aq:true,ten_bit:true}));
     assert!(has(&full,"-bf","3")&&has(&full,"-b_ref_mode","middle")&&has(&full,"-temporal-aq","1"));
+}
+
+#[test]
+fn hardware_initial_rate_reserves_video_budget_only() {
+    let mut info=media::parse("fixture.mp4".into(),br#"{"format":{"duration":"30"},"streams":[{"codec_type":"video","width":1920,"height":1080,"pix_fmt":"yuv420p","avg_frame_rate":"30000/1001"},{"codec_type":"audio","channels":2}]}"#).unwrap();
+    for duration in [30_000_000,600_000_000,600_000_001,3_600_000_000] {
+        info.duration_us=Some(duration);
+        let plan=budget::plan(&info,100_000_000,Codec::Hevc,1280).unwrap();
+        let percent=if duration<=600_000_000{95}else{98};
+        for route in [Route::Nvenc,Route::Qsv,Route::Amf] {
+            assert_eq!(initial_bitrate(&plan,route),(u128::from(plan.video_bps)*percent/100) as u64);
+        }
+        assert_eq!(initial_bitrate(&plan,Route::Software),plan.video_bps);
+        assert_eq!(plan.video_bytes+plan.audio_bytes+plan.mux_reserve_bytes,plan.limit_bytes);
+    }
 }

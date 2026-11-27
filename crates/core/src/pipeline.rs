@@ -206,6 +206,33 @@ fn nvenc_quality(caps:Option<NvencCaps>)->Vec<&'static str>{
     args
 }
 
+// Reserve part of the video budget for rate-control variation, particularly
+// on short clips. The mux/audio reserves and final hard cap are unchanged.
+fn initial_bitrate(plan: &Plan<'_>, route: Route) -> u64 {
+    if route == Route::Software { return plan.video_bps; }
+    let percent = if budget::short_video(plan.duration_us) { 95 } else { 98 };
+    ((u128::from(plan.video_bps) * percent / 100) as u64).max(1)
+}
+
+fn video_filter(plan: &Plan<'_>, interlaced: bool, pix: &str) -> String {
+    let range = match plan.source.color_range.as_deref() {
+        Some("pc") => ":in_range=pc:out_range=pc",
+        Some("tv") => ":in_range=tv:out_range=tv",
+        _ => "",
+    };
+    // Hardware decoding commonly returns NV12/P010. CPU BWDIF accepts
+    // planar YUV, not semiplanar frames. With strict +pix_fmt FFmpeg will
+    // not insert an auto_scale, so negotiate explicitly before BWDIF.
+    // Convert the two fields independently and keep the source bit depth.
+    let deinterlace = if interlaced {
+        let planar = if plan.source.bit_depth == Some(10) { "yuv420p10le" } else { "yuv420p" };
+        format!("scale=iw:ih:interl=1{range},format={planar},bwdif=mode=send_field:parity=auto:deint=all,")
+    } else {
+        String::new()
+    };
+    format!("{deinterlace}scale={}:{}:flags=lanczos{range},format={pix}",plan.width,plan.height)
+}
+
 fn encode_command(
     request: &EncodeRequest<'_>,
     source: &MediaInfo,
@@ -224,22 +251,7 @@ fn encode_command(
         (_, true) => "yuv420p",
         _ => "nv12",
     };
-    let range = match plan.source.color_range.as_deref() {
-        Some("pc") => ":in_range=pc:out_range=pc",
-        Some("tv") => ":in_range=tv:out_range=tv",
-        _ => "",
-    };
-    // scale adjusts SAR to keep the original DAR. Explicit format conversion
-    // is required because strict +pix_fmt disables auto-inserted converters.
-    let deinterlace = if interlaced {
-        "bwdif=mode=send_field:parity=auto:deint=all,"
-    } else {
-        ""
-    };
-    let filter = format!(
-        "{deinterlace}scale={}:{}:flags=lanczos{range},format={pix}",
-        plan.width, plan.height
-    );
+    let filter = video_filter(plan, interlaced, pix);
     let timescale = clock.den.to_string();
     let enc_time_base = format!("1:{timescale}");
     let video_rate = rate.to_string();
@@ -282,7 +294,12 @@ fn encode_command(
         let ceiling = if route == Route::Qsv {
             rate.saturating_add(rate.div_ceil(5))
         } else if route==Route::Nvenc {
-            rate.saturating_add(rate.saturating_mul(2)/5)
+            // A narrower peak window on short clips limits burst overshoot.
+            if budget::short_video(plan.duration_us) {
+                rate.saturating_add(rate.div_ceil(5))
+            } else {
+                rate.saturating_add(rate.saturating_mul(2)/5)
+            }
         } else {
             rate
         };
@@ -567,7 +584,7 @@ fn encode_inner(
     observe(Event::NvencOptions{caps:nvenc_caps,enabled:route==Route::Nvenc});
     let stage = Stage::create(&directory).map_err(|e| io_error(e, cancel))?;
     let output = stage.0.join("encoded.mp4");
-    let mut rate = plan.video_bps;
+    let mut rate = initial_bitrate(&plan, route);
     for reencodes in 0..=MAX_REENCODES {
         check_cancel(cancel)?;
         unchanged(&source.path, &source_meta, cancel)?;

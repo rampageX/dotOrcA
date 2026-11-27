@@ -639,7 +639,8 @@ fn observe(job: &mut Job, event: Event<'_>) {
                 note(job, message!(Preflight, job.encoder.unwrap(), detail));
             }
         }
-        Event::Encoding { route, .. } => {
+        Event::Encoding { route, video_bps } => {
+            note(job,message!(AttemptRate,job.retries+1,format!("{:.0}",video_bps as f64/1000.0)));
             job.phase = Phase::Encoding;
             job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
             job.progress_percent = Some(0);
