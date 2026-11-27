@@ -51,7 +51,7 @@ impl Library {
         let name:Vec<u16>=name.encode_utf16().chain(Some(0)).collect();
         // Only System32: never load DLLs from the portable or working directory.
         let handle=unsafe{LoadLibraryExW(name.as_ptr(),null_mut(),0x800)};
-        (!handle.is_null()).then_some(Self(handle))
+        if handle.is_null(){None}else{Some(Self(handle))}
     }
     fn symbol(&self,name:&CStr)->Option<Handle>{
         let p=unsafe{GetProcAddress(self.0,name.as_ptr())};

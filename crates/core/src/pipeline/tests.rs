@@ -97,6 +97,18 @@ fn production_special_path_vfr_audio_and_hdr() {
     };
     let first = encode(&request, &mut detector, &cancel, logs).unwrap();
     assert!(first.bytes <= request.limit_bytes && first.bytes > 0);
+    // Encode the same actual 8-bit fixture through the two 10-bit output policies.
+    for codec in [Codec::Hevc,Codec::Av1] {
+        let promoted=root.0.join(format!("{}-main10.mp4",codec.label()));
+        request.codec=codec;request.destination=&promoted;
+        let encoded=encode(&request,&mut detector,&cancel,logs).unwrap();
+        assert!(encoded.bytes>0 && encoded.bytes<=request.limit_bytes);
+        let info=media::probe(&ffprobe,&promoted,&cancel).unwrap();
+        assert_eq!(info.streams[0].bit_depth,Some(10));
+        request.destination=&destination;
+        fs::remove_file(&promoted).unwrap();
+    }
+    request.codec=Codec::H264;
     let cancel_out = root.0.join("cancelled.mp4");
     request.destination = &cancel_out;
     assert!(matches!(

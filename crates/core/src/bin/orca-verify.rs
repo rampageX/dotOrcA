@@ -83,7 +83,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         &AtomicBool::new(false),
         |event| {
             let event = match event {
-                        Event::NvencOptions{caps,enabled} => { let _=(caps,enabled); },
+                Event::NvencOptions{caps,enabled} => json!({"kind":"nvenc_caps","enabled":enabled,
+                    "caps":caps.map(|c|json!({"max_b_frames":c.max_b_frames,"middle_ref":c.middle_ref,
+                        "lookahead":c.lookahead,"temporal_aq":c.temporal_aq,"ten_bit":c.ten_bit}))}),
                 Event::Source(_) => json!({"kind": "source_metadata"}),
                 Event::Plan(_) => json!({"kind": "capacity_plan"}),
                 Event::Decision(decision) => {
@@ -95,6 +97,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                             "source_width": plan.source.width,
                             "source_height": plan.source.height,
                             "source_bit_depth": plan.source.bit_depth,
+                            "output_bit_depth": plan.output_depth(),
                             "source_hdr": format!("{:?}", plan.source.hdr),
                             "output_width": plan.width,
                             "output_height": plan.height,
