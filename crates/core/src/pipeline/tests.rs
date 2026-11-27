@@ -100,15 +100,24 @@ fn production_special_path_vfr_audio_and_hdr() {
     // Encode the same actual 8-bit fixture through the two 10-bit output policies.
     for codec in [Codec::Hevc,Codec::Av1] {
         let promoted=root.0.join(format!("{}-main10.mp4",codec.label()));
-        request.codec=codec;request.destination=&promoted;
-        let encoded=encode(&request,&mut detector,&cancel,logs).unwrap();
-        assert!(encoded.bytes>0 && encoded.bytes<=request.limit_bytes);
+        // Give each conversion its own request and lifetime; the reusable
+        // outer request must never borrow a loop-local destination.
+        let promoted_request = EncodeRequest {
+            source: request.source,
+            destination: &promoted,
+            ffmpeg: request.ffmpeg,
+            ffprobe: request.ffprobe,
+            limit_bytes: request.limit_bytes,
+            codec,
+            max_long_edge: request.max_long_edge,
+            timeout: request.timeout,
+        };
+        let encoded=encode(&promoted_request,&mut detector,&cancel,logs).unwrap();
+        assert!(encoded.bytes>0 && encoded.bytes<=promoted_request.limit_bytes);
         let info=media::probe(&ffprobe,&promoted,&cancel).unwrap();
         assert_eq!(info.streams[0].bit_depth,Some(10));
-        request.destination=&destination;
         fs::remove_file(&promoted).unwrap();
     }
-    request.codec=Codec::H264;
     let cancel_out = root.0.join("cancelled.mp4");
     request.destination = &cancel_out;
     assert!(matches!(
