@@ -47,28 +47,19 @@ fn boundary(action: impl FnOnce(&mut Gui) -> i32) -> i32 {
 }
 
 
-fn config_path(name: &str) -> io::Result<PathBuf> {
+fn config_dir() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let parent = exe.parent().ok_or_else(|| io::Error::other(text::en(Msg::ExeDirectory)))?;
-    Ok(parent.join("config").join(name))
+    Ok(parent.join("config"))
 }
+
+mod config;
+
 fn save_config(name: &str, value: &str) -> io::Result<()> {
-    let path = config_path(name)?;
-    fs::create_dir_all(path.parent().expect("config parent"))?;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&temporary, value)?;
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
+    config::save(&config_dir()?, name, value)
 }
 fn read_config(name: &str) -> io::Result<Option<String>> {
-    match fs::read_to_string(config_path(name)?) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    config::read(&config_dir()?, name)
 }
 #[no_mangle]
 pub extern "C" fn orca_ui_init(system_zh: i32) -> i32 {
