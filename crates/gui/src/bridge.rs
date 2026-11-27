@@ -50,7 +50,7 @@ fn boundary(action: impl FnOnce(&mut Gui) -> i32) -> i32 {
 fn config_dir() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let parent = exe.parent().ok_or_else(|| io::Error::other(text::en(Msg::ExeDirectory)))?;
-    Ok(parent.join("config"))
+    Ok(parent.to_path_buf())
 }
 
 mod config;
