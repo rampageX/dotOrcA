@@ -271,6 +271,9 @@ static void tick_detail(window_state *window) {
     }
     /* Do not block the main loop waiting for detail-window input. */
     cui_request_wakeup(ui,0.001f);
+    /* Finish before the other HWND pumps messages. CUI clears input at end_frame;
+       leaving a frame open across another window's pump drops click/keyboard edges. */
+    cui_end_frame(ui);
 }
 
 static void draw_job(cui_ctx *ui, window_state *window, uint32_t index) {
@@ -509,6 +512,7 @@ int orca_cui_run(void) {
     install_advanced(&window);
     while (cui_app_frame(window.main_app)) {
         frame(cui_app_ui(window.main_app),&window);
+        cui_end_frame(cui_app_ui(window.main_app));
         tick_detail(&window);
     }
     close_detail(&window);

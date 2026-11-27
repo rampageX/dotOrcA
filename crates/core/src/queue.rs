@@ -134,6 +134,7 @@ pub struct Job {
     pub phase: Phase,
     pub encoder: Option<&'static str>,
     pub progress_percent: Option<u8>,
+    pub speed: Option<f64>,
     pub output: Option<PathBuf>,
     pub bytes: Option<u64>,
     pub elapsed: Option<Duration>,
@@ -162,6 +163,7 @@ impl Job {
             phase: Phase::Waiting,
             encoder: None,
             progress_percent: None,
+            speed: None,
             output: None,
             bytes: None,
             elapsed: None,
@@ -534,6 +536,8 @@ fn observe(job: &mut Job, event: Event<'_>) {
         Event::Source(source) => job.source_info = Some(text::media_summary(source)),
         Event::Plan(plan) => {
             job.target_info = Some(text::target_summary(plan));
+            if plan.low_bpp {note(job,text::en(Msg::LowBpp).into());}
+            if plan.adaptive_downscale {note(job,text::en(Msg::AdaptiveScale).into());}
         }
         Event::Decision(decision) => {
             job.phase = Phase::Preflight;
@@ -580,6 +584,7 @@ fn observe(job: &mut Job, event: Event<'_>) {
             job.phase = Phase::Encoding;
             job.encoder = Some(route.encoder(job.settings.expect("started job").codec));
             job.progress_percent = Some(0);
+            job.speed=None;
         }
         Event::Validating => {
             job.phase = Phase::Validating;
@@ -686,8 +691,8 @@ fn encode(
                 timeout: Duration::from_secs(86_400),
         };
         let observer = |event: Event<'_>| { update.modify(|job| observe(job, event)); };
-        let report = |percent| { update.modify(|job| {
-            if job.phase == Phase::Encoding { job.progress_percent = Some(percent); }
+        let report = |percent,speed| { update.modify(|job| {
+            if job.phase == Phase::Encoding { job.progress_percent = Some(percent);job.speed=Some(speed); }
         }); };
         let publication = pipeline::encode_with_progress(&request, detector, cancel, observer, Some(&report))?;
         // One metadata-only read of the saved container, never a frame scan.
@@ -701,6 +706,7 @@ fn encode(
     if let Some(mut completed) = update.modify(|current| current.clone()) {
         let job = &mut completed;
         job.progress_percent = None;
+        job.speed=None;
         match result {
             Ok(None) => {
                 if cancel.load(Ordering::Acquire) {

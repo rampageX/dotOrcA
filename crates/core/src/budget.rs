@@ -16,6 +16,7 @@ pub struct Plan<'a> {
     pub limit_bytes: u64,
     pub duration_us: u64,
     pub audio_bps: Vec<u64>,
+    pub audio_copy: Vec<bool>,
     pub audio_bytes: u64,
     pub mux_reserve_bytes: u64,
     pub video_bytes: u64,
@@ -23,6 +24,8 @@ pub struct Plan<'a> {
     pub codec: Codec,
     pub width: u64,
     pub height: u64,
+    pub low_bpp: bool,
+    pub adaptive_downscale: bool,
     /// Retain original timestamps, including VFR. Average is descriptive only.
     pub source_rate: Option<Rational>,
     /// Includes original depth, HDR, color tags, SAR and raw side data.
@@ -34,15 +37,34 @@ pub fn fits(limit: u64, measured: Option<u64>) -> bool {
     measured.is_some_and(|bytes| bytes > 0 && bytes <= limit)
 }
 
+pub const SHORT_LIMIT_US:u64=600_000_000;
+pub fn short_video(duration_us:u64)->bool { duration_us<=SHORT_LIMIT_US }
+fn threshold(codec:Codec)->u128 {match codec {Codec::H264=>7,Codec::Hevc=>5,Codec::Av1=>4}}
+fn adequate_bpp(codec:Codec,bps:u64,w:u64,h:u64,rate:Option<Rational>,interlaced:bool)->bool {
+    rate.is_none_or(|r| {
+        let bits = u128::from(bps).saturating_mul(u128::from(r.denominator)).saturating_mul(100);
+        let pixels=u128::from(w).saturating_mul(u128::from(h)).saturating_mul(u128::from(r.numerator))
+            .saturating_mul(if interlaced{2}else{1}).saturating_mul(threshold(codec));
+        bits>=pixels
+    })
+}
 pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> Result<Plan<'_>, Error> {
     let mut video = None;
     let mut audio_bps = Vec::new();
+    let mut audio_copy = Vec::new();
+    let mut audio_channels = Vec::new();
     for stream in &media.streams {
         match stream.kind.as_deref() {
             Some("video") if !stream.attached_picture && video.is_none() => video = Some(stream),
             Some("audio") => {
                 let channels = stream.channels.filter(|n| *n > 0).ok_or(Error::UnknownChannels)?;
-                audio_bps.push(channels.checked_mul(64_000).ok_or(Error::RateOverflow)?);
+                let normal=channels.checked_mul(64_000).ok_or(Error::RateOverflow)?;
+                let source_rate=stream.raw["bit_rate"].as_u64().or_else(||stream.raw["bit_rate"].as_str()?.parse().ok());
+                // Only copy AAC, which is already compatible with MP4, and only with a known budget.
+                let copy=stream.codec.as_deref()==Some("aac") && source_rate.is_some_and(|n|n>0 && n<=normal.min(128_000));
+                audio_channels.push(channels);
+                audio_copy.push(copy);
+                audio_bps.push(if copy {source_rate.unwrap()} else {normal});
             }
             // Production maps the first non-cover video and all audio tracks.
             _ => {}
@@ -53,33 +75,53 @@ pub fn plan(media: &MediaInfo, limit: u64, codec: Codec, max_long_edge: u32) -> 
     let (w,h) = source.width.zip(source.height).ok_or(Error::UnknownGeometry)?;
     if w < 2 || h < 2 || max_long_edge < 2 { return Err(Error::UnknownGeometry); }
 
-    // Reserve per track, rounding up to whole bytes before subtraction.
-    let mut audio_bytes = 0u64;
-    for &rate in &audio_bps {
-        let bytes = (u128::from(rate) * u128::from(duration)).div_ceil(8_000_000);
-        let bytes = u64::try_from(bytes).map_err(|_| Error::InsufficientCapacity)?;
-        audio_bytes = audio_bytes.checked_add(bytes).ok_or(Error::InsufficientCapacity)?;
-    }
+    // Keep all channels/tracks. Reduce AAC rates only under a tight video budget.
     let mux = 4096 + limit.div_ceil(100);
+    let usable=limit.checked_sub(mux).ok_or(Error::InsufficientCapacity)?;
+    let audio_size=|rates:&[u64],copies:&[bool]|->Result<u64,Error>{
+        rates.iter().zip(copies).try_fold(0u64,|sum,(&rate,&copy)| {
+            let rate=if copy {u128::from(rate)*105/100}else{u128::from(rate)};
+            let bytes=rate.checked_mul(u128::from(duration)).ok_or(Error::InsufficientCapacity)?.div_ceil(8_000_000);
+            sum.checked_add(u64::try_from(bytes).map_err(|_|Error::InsufficientCapacity)?).ok_or(Error::InsufficientCapacity)
+        })
+    };
+    let mut audio_bytes=audio_size(&audio_bps,&audio_copy);
+    for per_channel in [48_000u64,32_000] {
+        if audio_bytes.as_ref().is_ok_and(|&n|n<=usable/3){break;}
+        for (i,&channels) in audio_channels.iter().enumerate(){
+            let reduced=channels.checked_mul(per_channel).ok_or(Error::RateOverflow)?;
+            if reduced<audio_bps[i]{audio_bps[i]=reduced;audio_copy[i]=false;}
+        }
+        audio_bytes=audio_size(&audio_bps,&audio_copy);
+    }
+    let audio_bytes=audio_bytes?;
     let video_bytes = limit.checked_sub(mux).and_then(|n| n.checked_sub(audio_bytes))
         .ok_or(Error::InsufficientCapacity)?;
     let rate = u128::from(video_bytes) * 8_000_000 / u128::from(duration);
     let video_bps = u64::try_from(rate).map_err(|_| Error::RateOverflow)?;
     if video_bps == 0 { return Err(Error::InsufficientCapacity); }
 
-    // Respect the chosen maximum, without an additional BPP-driven drop.
-    // The secondary BPP policy is deferred until its quality targets are reviewed.
-    let long = w.max(h);
-    let cap = u64::from(max_long_edge);
-    let rate = source.avg_rate.filter(|r| r.numerator > 0 && r.denominator > 0);
-    let (width,height) = if long <= cap { (w,h) } else {
-        let scale = |side| ((u128::from(side) * u128::from(cap) / u128::from(long)) as u64) & !1;
-        let (x,y) = (scale(w),scale(h));
-        if x < 2 || y < 2 { return Err(Error::UnknownGeometry); }
-        (x,y)
+    let long=w.max(h);
+    let cap=u64::from(max_long_edge).min(long);
+    let rate=source.avg_rate.filter(|r|r.numerator>0&&r.denominator>0);
+    let interlaced=matches!(source.raw["field_order"].as_str(),Some("tt"|"bb"|"tb"|"bt"));
+    let geometry=|edge:u64|->Option<(u64,u64)> {
+        if edge==long{return Some((w,h));}
+        let scale=|side| ((u128::from(side)*u128::from(edge)/u128::from(long)) as u64)&!1;
+        let (x,y)=(scale(w),scale(h));
+        (x>=2&&y>=2).then_some((x,y))
     };
-    Ok(Plan { limit_bytes: limit, duration_us: duration, audio_bps, audio_bytes,
-        mux_reserve_bytes: mux, video_bytes, video_bps, codec, width, height,
+    let (mut width,mut height)=geometry(cap).ok_or(Error::UnknownGeometry)?;
+    let mut adaptive_downscale=false;
+    if !short_video(duration) && rate.is_some() {
+        for edge in [3840,2560,1920,1280,960,854,640].into_iter().filter(|&n|n<cap) {
+            if adequate_bpp(codec,video_bps,width,height,rate,interlaced){break;}
+            if let Some((x,y))=geometry(edge){width=x;height=y;adaptive_downscale=true;}
+        }
+    }
+    let low_bpp=!adequate_bpp(codec,video_bps,width,height,rate,interlaced);
+    Ok(Plan { limit_bytes: limit, duration_us: duration, audio_bps, audio_copy, audio_bytes,
+        mux_reserve_bytes: mux, video_bytes, video_bps, codec, width, height, low_bpp, adaptive_downscale,
         source_rate: rate, source })
 }
 
@@ -125,6 +167,34 @@ mod tests {
             let p = plan(&m,5_117_000,codec,1280).unwrap();
             assert_eq!((p.width,p.height),(1280,720));
         }
+    }
+    #[test]
+    fn long_video_only_and_actual_field_cadence() {
+        let mut m=media();m.streams.truncate(1);
+        m.streams[0].width=Some(1920);m.streams[0].height=Some(1080);
+        m.streams[0].avg_rate=Some(Rational{numerator:30,denominator:1});
+        m.duration_us=Some(SHORT_LIMIT_US);
+        let short=plan(&m,120_000_000,Codec::Hevc,1280).unwrap();
+        assert_eq!((short.width,short.height),(1280,720));
+        assert!(!short.adaptive_downscale);
+        m.duration_us=Some(SHORT_LIMIT_US+1);
+        let long=plan(&m,120_000_000,Codec::Hevc,1280).unwrap();
+        assert_eq!((long.width,long.height),(1280,720));
+        m.streams[0].raw["field_order"]=json!("tb");
+        let fields=plan(&m,120_000_000,Codec::Hevc,1280).unwrap();
+        assert!(fields.width<1280 && fields.adaptive_downscale);
+        assert!(!short_video(SHORT_LIMIT_US+1));
+    }
+    #[test]
+    fn audio_copy_and_tight_budget() {
+        let mut m=media();
+        m.streams.truncate(2);
+        m.streams[1].codec=Some("aac".into());
+        m.streams[1].raw["bit_rate"]=json!("96000");
+        let a=plan(&m,10_000_000,Codec::Hevc,1280).unwrap();
+        assert_eq!(a.audio_copy,[true]);assert_eq!(a.audio_bps,[96000]);
+        let b=plan(&m,1_000_000,Codec::Hevc,1280).unwrap();
+        assert_eq!(b.audio_copy,[false]);assert_eq!(b.audio_bps,[64000]);
     }
     #[test]
     fn limits_and_unknowns() {

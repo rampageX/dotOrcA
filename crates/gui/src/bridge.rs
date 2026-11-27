@@ -470,6 +470,7 @@ pub unsafe extern "C" fn orca_row(index: u32, out: *mut Row, capacity: usize) ->
         }
         if job.retries > 0 { status.push_str(&format!("  |  {}",localized!(lang,RetryStatus,job.retries))); }
         if let Some(encoder) = job.encoder { status.push_str(&format!("  |  {encoder}")); }
+        if job.phase==Phase::Encoding {if let Some(speed)=job.speed {status.push_str(&format!("  |  {}",localized!(lang,SpeedStatus,format!("{speed:.2}"))));}}
         if let (Some(bytes),Some(elapsed)) = (job.bytes,job.elapsed) {
             status.push_str(&format!("  |  {}",localized!(lang,OutputStatus,readable_size(bytes),format!("{:.1}",elapsed.as_secs_f64()))));
         }
@@ -506,6 +507,7 @@ fn detail_section(job: &Job, lang: Language, section: u32) -> String {
             if let Some(reason) = job.skip_reason { lines.push(localized!(lang,SkipDetail,text::localize(lang,reason))); }
             if let Some(encoder) = job.encoder { lines.push(encoder.into()); }
             if let Some(p) = job.progress_percent { lines.push(format!("{p}%")); }
+            if job.phase==Phase::Encoding {if let Some(speed)=job.speed {lines.push(localized!(lang,SpeedStatus,format!("{speed:.2}")));}}
             if job.retries > 0 { lines.push(localized!(lang,RetryStatus,job.retries)); }
             lines.extend(job.detail.iter().map(|s|text::localize(lang,s)));
         }

@@ -244,8 +244,9 @@ fn encode_command(
             "empty_output",
             "-copyts",
             "-noautorotate",
-            "-i",
-        ])
+        ]);
+    if route != Route::Software { cmd=cmd.args(["-hwaccel","auto"]); }
+    cmd=cmd.args(["-i"])
         .args([source.path.as_os_str()])
         .args([
             "-map",
@@ -268,6 +269,8 @@ fn encode_command(
     if !(route == Route::Software && plan.codec == Codec::Av1) {
         let ceiling = if route == Route::Qsv {
             rate.saturating_add(rate.div_ceil(5))
+        } else if route==Route::Nvenc {
+            rate.saturating_add(rate.saturating_mul(2)/5)
         } else {
             rate
         };
@@ -279,7 +282,7 @@ fn encode_command(
         ]);
     }
     match route {
-        Route::Nvenc => cmd = cmd.args(["-preset", "p4", "-rc", "vbr"]),
+        Route::Nvenc => cmd = cmd.args(["-preset","p5","-tune","hq","-rc","vbr","-multipass","qres","-spatial-aq","1","-rc-lookahead","16"]),
         Route::Amf => cmd = cmd.args(["-rc", "vbr_peak"]),
         Route::Software => {
             cmd = match plan.codec {
@@ -321,9 +324,13 @@ fn encode_command(
         }
     }
     if !plan.audio_bps.is_empty() {
-        cmd = cmd.args(["-map", "0:a", "-c:a", "aac"]);
+        cmd = cmd.args(["-map", "0:a"]);
         for (index, rate) in plan.audio_bps.iter().enumerate() {
-            cmd = cmd.args([format!("-b:a:{index}"), rate.to_string()]);
+            if plan.audio_copy[index] {
+                cmd=cmd.args([format!("-c:a:{index}"),"copy".into()]);
+            } else {
+                cmd=cmd.args([format!("-c:a:{index}"),"aac".into(),format!("-b:a:{index}"),rate.to_string()]);
+            }
         }
     }
     for stream in &source.streams {
@@ -339,6 +346,8 @@ fn encode_command(
         }
     }
     cmd = cmd.args(["-c:s", "mov_text"]);
+    if budget::short_video(plan.duration_us) {cmd=cmd.args(["-movflags","+faststart"]);}
+    if plan.codec==Codec::Hevc {cmd=cmd.args(["-tag:v","hvc1"]);}
     cmd = cmd
         .args([
             "-map_metadata",
@@ -397,7 +406,8 @@ fn finish_encoder(
 
 /// FFmpeg progress records are line oriented. Keep a fixed-size line buffer
 /// and discard long fields while continuing to drain the pipe.
-fn read_progress(mut input: impl Read, total: u64, report: &dyn Fn(u8)) {
+fn read_progress(mut input: impl Read, total: u64, report: &dyn Fn(u8,f64)) {
+    let start=Instant::now();
     let mut chunk = [0; 4096];
     let mut line = [0; 64];
     let mut len = 0;
@@ -415,7 +425,8 @@ fn read_progress(mut input: impl Read, total: u64, report: &dyn Fn(u8)) {
                             (100 * u128::from(timestamp) / u128::from(total)).min(99) as u8;
                         if percent > last {
                             last = percent;
-                            report(percent);
+                            let speed=timestamp as f64/1_000_000.0/start.elapsed().as_secs_f64().max(0.001);
+                            report(percent,speed);
                         }
                     }
                 }
@@ -455,7 +466,7 @@ pub fn encode_with_progress(
     detector: &mut Detector,
     cancel: &AtomicBool,
     observe: impl FnMut(Event<'_>),
-    progress: Option<&(dyn Fn(u8) + Sync)>,
+    progress: Option<&(dyn Fn(u8,f64) + Sync)>,
 ) -> Result<Published, Error> {
     encode_inner(request, detector, cancel, observe, progress)
 }
@@ -465,7 +476,7 @@ fn encode_inner(
     detector: &mut Detector,
     cancel: &AtomicBool,
     mut observe: impl FnMut(Event<'_>),
-    progress: Option<&(dyn Fn(u8) + Sync)>,
+    progress: Option<&(dyn Fn(u8,f64) + Sync)>,
 ) -> Result<Published, Error> {
     let start = Instant::now();
     check_cancel(cancel)?;

@@ -7,3 +7,5 @@ Cargo Workspace：core（纯 Rust）、gui（Rust UI adapter + C bridge）、s00
 便携布局：dotorca.exe、tools/、config/、output/、logs/、work/；以 EXE 目录为基准。语言、主窗口及详情窗口位置大小、容量/编码/分辨率及自定义输出与工具目录保存在 config/；自定义 FFmpeg 目录优先，否则 tools/ 后查找系统 PATH 中同目录的 FFmpeg/FFprobe；任务启动时冻结目录。旧 data/ 不再读取或写入，不主动删除用户文件。
 
 GUI：CUI v1.5.0 固定上游 commit，MSVC static CRT，软件渲染。主窗口与独立详情窗口均在 UI 线程以各自 CUI 上下文处理，不嵌套模态循环；一个详情窗口可切换任务，通过稳定 ID 获取最新快照，任务移除或主窗口退出时销毁。五个只读分区支持选择、复制、滚动，错误和标题高亮。C ABI 传递 UTF-8；中文使用系统字体 fallback，不分发字体。默认随系统语言，用户可切换并记忆设置。原始 FFmpeg 诊断保留原文。混合 DPI 和无 CJK 字体环境仍需实机验证。
+
+长视频策略：>600s 启用 BPP 自适应，≤600s FastStart；AAC 已兼容低码率音轨可 Copy，其余保留声道按预算编码，必要时降低 AAC 码率；NVENC P5/HQ/QuarterRes/Spatial AQ/lookahead16 为候选测试参数；HEVC hvc1、自动硬解、实际倍速与低 BPP 提示。保留源位深，其他高级编码器参数及 8→10 bit 等实机验证后再定。

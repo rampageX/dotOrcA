@@ -22,3 +22,5 @@
 解压到可写目录，在 EXE 同级 tools/ 放置支持所需硬件编码器的 ffmpeg.exe、ffprobe.exe。ZIP 不包含 FFmpeg，既有官方数据内嵌；日志与本地数据保留于便携目录。第三方许可及构建证据随包提供。
 
 验收：RTX 4080 实机通过用户验收，最终发行由完整自动回归门禁控制。独立 ETA 校准、干净 Windows、真实 UNC、QSV/AMF 和逐适配器验证仍待补充。项目自有代码于 v1.0.0 发布后经作者授权采用 MIT License，见仓库根目录 LICENSE；第三方许可不变。原始发行包不重打包。
+
+候选优化：600 秒分界 BPP/FastStart、AAC copy 与紧预算降码率、NVENC P5 HQ quarter-resolution multipass spatial AQ lookahead 16、自动硬解、hvc1、实时倍速、低 BPP 提示及详情窗口消息边沿修复。硬件收益与交互等待实机验收。
