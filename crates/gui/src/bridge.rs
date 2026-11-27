@@ -364,6 +364,10 @@ pub unsafe extern "C" fn orca_frame(out: *mut c_char, capacity: usize, count: *m
             text.push_str("   |   ");
             text.push_str(&text::localize(lang, &app.notice));
         }
+        if let Some(error)=app.queue.as_ref().and_then(Queue::log_error) {
+            text.push_str("   |   ");
+            text.push_str(&text::localize(lang,&error));
+        }
         unsafe {
             *count = total as u32;
             write_text(out, capacity, &text);

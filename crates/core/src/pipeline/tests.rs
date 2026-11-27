@@ -83,7 +83,8 @@ fn production_special_path_vfr_audio_and_hdr() {
     );
     // The actual special-character fixture must have metadata while still
     // queued, without starting any encoder.
-    let queue=crate::queue::Queue::portable(root.0.clone()).unwrap();
+    let preview_root=test_root();
+    let queue=crate::queue::Queue::portable(preview_root.0.clone()).unwrap();
     queue.add_with_paths(&source,crate::queue::Paths{
         tools:Some(ffprobe.parent().unwrap().into()),output:None
     }).unwrap();
@@ -293,11 +294,14 @@ fn production_special_path_vfr_audio_and_hdr() {
     // Reproduce the actual hardware-decoder output formats even on CI
     // without a GPU. Use the production filter chain and strict +pix_fmt.
     let mut info = media::probe(&ffprobe, &interlaced, &cancel).unwrap();
+    // Use field/chroma-aligned synthetic dimensions for the semiplanar
+    // swscale fixture, independent of the original 320x180 real encode.
+    info.streams[0].height=Some(192);
     for (input, depth, output) in [("nv12",8,"p010le"),("p010le",10,"p010le")] {
         info.streams[0].bit_depth=Some(depth);
         let plan=budget::plan(&info,1_048_576,Codec::Hevc,256).unwrap();
         let graph=video_filter(&plan,true,output);
-        let fixture=format!("testsrc2=size=320x180:rate=50:duration=1,tinterlace=interleave_top,scale=iw:ih:interl=1,format={input}");
+        let fixture=format!("testsrc2=size=320x192:rate=50:duration=1,tinterlace=interleave_top,scale=iw:ih:interl=1,format={input}");
         let cmd=Request::new(&ffmpeg).args(["-hide_banner","-v","error","-xerror","-f","lavfi","-i",&fixture,
             "-vf",&graph,"-pix_fmt",&format!("+{output}"),"-c:v","wrapped_avframe","-f","null","-"]);
         let result=process::run(&cmd,&cancel).unwrap();

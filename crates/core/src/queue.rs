@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -200,6 +200,8 @@ struct State {
     clearing: bool,
     active: Vec<(u32, String)>,
     parallelism: usize,
+    log_sender: Option<mpsc::SyncSender<Arc<Job>>>,
+    log_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -212,6 +214,7 @@ struct Shared {
 pub struct Queue {
     shared: Arc<Shared>,
     worker: JoinHandle<()>,
+    logger: Option<JoinHandle<()>>,
 }
 
 impl Queue {
@@ -248,6 +251,14 @@ impl Queue {
         run: impl FnOnce(&Shared) + Send + std::panic::UnwindSafe + 'static,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
+        let logger = if let Some(root) = preview_root.clone() {
+            let (tx, rx) = mpsc::sync_channel(CAPACITY * 2);
+            let log_shared=Arc::clone(&shared);
+            let handle=thread::Builder::new().name("dotOrcA session log".into())
+                .spawn(move || session_log_worker(&root, rx, &log_shared))?;
+            shared.state.lock().unwrap_or_else(|e|e.into_inner()).log_sender=Some(tx);
+            Some(handle)
+        } else { None };
         let background = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("dotOrcA queue".into())
@@ -268,7 +279,15 @@ impl Queue {
                         }
                     }
                 }
-            })?;
+            });
+        let worker = match worker {
+            Ok(worker)=>worker,
+            Err(error)=>{
+                shared.state.lock().unwrap_or_else(|e|e.into_inner()).log_sender.take();
+                if let Some(logger)=logger {let _=logger.join();}
+                return Err(error);
+            }
+        };
         // A separate bounded metadata worker also services queued files while
         // encoding is active. It holds no lock during filesystem access.
         let sizes = Arc::clone(&shared);
@@ -276,10 +295,10 @@ impl Queue {
             .name("dotOrcA source metadata".into())
             .spawn(move || read_source_metadata(&sizes, preview_root.as_deref()))
         {
-            Self { shared, worker }.shutdown();
+            Self { shared, worker, logger }.shutdown();
             return Err(error);
         }
-        Ok(Self { shared, worker })
+        Ok(Self { shared, worker, logger })
     }
 
     pub fn add(&self, source: &Path) -> Result<u32, &'static str> {
@@ -356,11 +375,11 @@ impl Queue {
 
     pub fn cancel(&self, id: u32) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in &mut state.entries {
-            if entry.view.id == id || id == 0 {
-                cancel_entry(entry);
-            }
-        }
+        cancel_matching(&mut state,id);
+    }
+
+    pub fn log_error(&self) -> Option<String> {
+        self.shared.state.lock().unwrap_or_else(|e|e.into_inner()).log_error.clone()
     }
 
     /// Reset only a terminal row. A fresh ID and cancel token prevent a
@@ -396,9 +415,7 @@ impl Queue {
     /// queue only after the encoder has exited and its cleanup has returned.
     pub fn clear_all(&self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in &mut state.entries {
-            cancel_entry(entry);
-        }
+        cancel_matching(&mut state,0);
         if state.active.is_empty() && state.entries.iter().all(|entry| entry.view.phase.finished()) {
             state.entries.clear();
             state.clearing = false;
@@ -417,15 +434,17 @@ impl Queue {
         {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             state.closing = true;
-            for entry in &mut state.entries {
-                cancel_entry(entry);
-            }
+            cancel_matching(&mut state,0);
             self.shared.ready.notify_all();
             self.shared.size_ready.notify_one();
         }
         // Do not join a metadata call that may be blocked by an offline UNC
         // share. The detached reader owns only Shared and exits on closing.
         let _ = self.worker.join();
+        // The preview worker is detached, so explicitly close the sender.
+        // Drain the bounded session log queue after all encoders have exited.
+        self.shared.state.lock().unwrap_or_else(|e|e.into_inner()).log_sender.take();
+        if let Some(logger)=self.logger { let _=logger.join(); }
     }
 }
 
@@ -478,6 +497,27 @@ fn read_source_metadata(shared: &Shared, root: Option<&Path>) {
             }
         });
     }
+}
+
+fn enqueue_log(state: &mut State, job: Arc<Job>) {
+    if let Some(sender)=&state.log_sender {
+        if let Err(error)=sender.try_send(job) {
+            state.log_error=Some(message!(LogFailed,error));
+        }
+    }
+}
+fn cancel_matching(state: &mut State, id: u32) {
+    // Only the UI-cancelled, never-started jobs finish here; the encoder
+    // worker publishes the terminal records for started jobs.
+    let mut terminal=Vec::new();
+    for entry in &mut state.entries {
+        if id==0 || entry.view.id==id {
+            let was_pending=matches!(entry.view.phase,Phase::Waiting|Phase::Ready);
+            cancel_entry(entry);
+            if was_pending && entry.view.phase==Phase::Cancelled {terminal.push(Arc::clone(&entry.view));}
+        }
+    }
+    for job in terminal {enqueue_log(state,job);}
 }
 
 fn cancel_entry(entry: &mut Entry) {
@@ -819,12 +859,10 @@ fn encode(
                 note(job, detail);
             }
         }
-        if let Err(error) = write_log(root, job) {
-            note(job, message!(LogFailed,error));
-        }
-        update.modify(|job| {
-            // The size reader may have completed while the terminal log was
-            // being written; never replace its newer metadata with a stale copy.
+        let mut state=update.shared.state.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(entry)=state.entries.iter_mut().find(|e|e.view.id==update.id) {
+            let job=Arc::make_mut(&mut entry.view);
+            // Preserve preview information that arrived during finalization.
             completed.source_bytes = job.source_bytes;
             completed.source_size_pending = job.source_size_pending;
             completed.source_meta_pending = job.source_meta_pending;
@@ -832,23 +870,80 @@ fn encode(
             completed.source_video = job.source_video.clone();
             completed.source_meta_error = job.source_meta_error.clone();
             *job = completed;
-        });
+            let record=Arc::clone(&entry.view);
+            enqueue_log(&mut state,record);
+        }
     }
 }
 
-fn write_log(root: &Path, job: &Job) -> io::Result<()> {
-    let directory = root.join("logs");
+const LOG_RETENTION:usize=30;
+
+// Only recognize names generated by dotOrcA, including its legacy per-job logs.
+fn log_timestamp(name:&str)->Option<u128>{
+    let stem=name.strip_suffix(".log")?;
+    let parts:Vec<_>=stem.split('-').collect();
+    match parts.as_slice(){
+        ["session",stamp,pid] if pid.parse::<u32>().is_ok()=>stamp.parse().ok(),
+        [stamp,pid,id] if pid.parse::<u32>().is_ok() && id.parse::<u32>().is_ok()=>stamp.parse().ok(),
+        _=>None,
+    }
+}
+fn prune_logs(dir:&Path,current:&Path)->io::Result<()> {
+    let mut old=Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry=entry?;
+        if !entry.file_type()?.is_file() || entry.path()==current {continue;}
+        if let Some(stamp)=entry.file_name().to_str().and_then(log_timestamp) {old.push((stamp,entry.path()));}
+    }
+    old.sort_unstable();
+    let excess=old.len().saturating_sub(LOG_RETENTION-1);
+    for (_,path) in old.into_iter().take(excess) {
+        if let Err(e)=fs::remove_file(path) {
+            if e.kind()!=io::ErrorKind::NotFound {return Err(e);}
+        }
+    }
+    Ok(())
+}
+fn open_session_log(root:&Path)->io::Result<(fs::File,Option<io::Error>)> {
+    let directory=root.join("logs");
     fs::create_dir_all(&directory)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = directory.join(format!("{timestamp}-{}-{}.log", std::process::id(), job.id));
-    let mut file = fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    writeln!(file, "{job:#?}")
+    let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let path=directory.join(format!("session-{timestamp:039}-{}.log",std::process::id()));
+    let mut options=fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(windows)] {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Permit readers, but not deletion of another live session's log.
+        options.share_mode(1);
+    }
+    let file=options.open(&path)?;
+    let prune_error=prune_logs(&directory,&path).err();
+    Ok((file,prune_error))
+}
+fn report_log_error(shared:&Shared, error:impl std::fmt::Display) {
+    shared.state.lock().unwrap_or_else(|e|e.into_inner()).log_error=Some(message!(LogFailed,error));
+}
+fn session_log_worker(root:&Path,rx:mpsc::Receiver<Arc<Job>>,shared:&Shared) {
+    let mut file=None;
+    while let Ok(job)=rx.recv() {
+        if file.is_none() {
+            match open_session_log(root) {
+                Ok((opened,prune_error))=>{
+                    if let Some(e)=prune_error {report_log_error(shared,e);}
+                    file=Some(opened);
+                }
+                Err(e)=>{report_log_error(shared,e);continue;}
+            }
+        }
+        if let Some(file)=file.as_mut() {
+            // One writer, complete task blocks. IDs remain stable even for
+            // identical filenames or a reset; the GUI uses those same records
+            // in memory rather than parsing disk on each redraw.
+            let result=writeln!(file,"===== TASK {} =====\n{:#?}\n===== END TASK {} =====\n",job.id,job,job.id)
+                .and_then(|_|file.flush());
+            if let Err(e)=result {report_log_error(shared,e);}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -858,6 +953,33 @@ mod tests {
         sync::{mpsc, Mutex},
         time::Instant,
     };
+
+    #[test]
+    fn session_log_retains_thirty_and_separates_task_ids() {
+        let root=std::env::temp_dir().join(format!("orca-session-log-{}",std::process::id()));
+        let _=fs::remove_dir_all(&root);
+        let dir=root.join("logs");
+        fs::create_dir_all(&dir).unwrap();
+        for n in 1..=35 {fs::write(dir.join(format!("session-{n:039}-1.log")),b"old").unwrap();}
+        fs::write(dir.join("unrelated.log"),b"keep").unwrap();
+        let queue=Queue::portable(root.clone()).unwrap();
+        let path=root.join("小K 的鹅腿坟场 & (黑洞) ^ % !.avi");
+        let id=queue.add(&path).unwrap();
+        queue.cancel(id);
+        queue.reset(id).unwrap();
+        let next=queue.snapshot()[0].id;
+        queue.cancel(next);
+        queue.clear_finished();
+        queue.shutdown();
+        let own:Vec<_>=fs::read_dir(&dir).unwrap().map(|e|e.unwrap().path()).filter(|p|p.file_name().unwrap().to_str().and_then(log_timestamp).is_some()).collect();
+        assert_eq!(own.len(),30);
+        let latest=own.iter().max_by_key(|p|log_timestamp(p.file_name().unwrap().to_str().unwrap())).unwrap();
+        let content=fs::read_to_string(latest).unwrap();
+        assert_eq!(content.matches(&format!("===== TASK {id} =====")).count(),1);
+        assert_eq!(content.matches(&format!("===== TASK {next} =====")).count(),1);
+        assert!(content.contains("Cancelled") && dir.join("unrelated.log").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn tool_pair_requires_both_and_an_absolute_directory() {
